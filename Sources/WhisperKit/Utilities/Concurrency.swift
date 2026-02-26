@@ -33,6 +33,27 @@ public actor EarlyStopActor {
     }
 }
 
+/// Lock-based early stop that avoids actor async overhead in the hot decode loop.
+public final class EarlyStopLock: @unchecked Sendable {
+    private let lock = UnfairLock()
+    private var shouldStop = [UUID: Bool]()
+
+    public init() {}
+
+    public func set(_ value: Bool, for uuid: UUID) {
+        lock.withLock { shouldStop[uuid] = value }
+    }
+
+    public func get(for uuid: UUID) -> Bool {
+        lock.withLock { shouldStop[uuid] ?? false }
+    }
+
+    @discardableResult
+    public func remove(for uuid: UUID) -> Bool? {
+        lock.withLock { shouldStop.removeValue(forKey: uuid) }
+    }
+}
+
 /// Serializes access to a value with an `os_unfair_lock` so mutation stays
 /// thread-safe. The wrapper is used by `TranscriptionResult`, which is marked
 /// `@unchecked Sendable`; guarding each property with this lock helps keep the

@@ -131,31 +131,31 @@ open class TranscribeTask {
                 Logging.debug("Decoding Seek: \(seek) (\(Logging.formatTimestamp(timeOffset))s)")
                 Logging.debug("Decoding Window Size: \(segmentSize) (\(Logging.formatTimestamp(timeOffsetEnd - timeOffset))s)")
 
-                let audioProcessingStart = Date()
+                let audioProcessingStart = CFAbsoluteTimeGetCurrent()
                 let clipAudioSamples = Array(audioArray[seek..<(seek + segmentSize)])
                 guard let audioSamples = audioProcessor.padOrTrim(fromArray: clipAudioSamples, startAt: 0, toLength: windowSamples) else {
                     throw WhisperError.transcriptionFailed("Audio samples are nil")
                 }
                 await windowPreprocess(for: audioSamples, seek: windowSeek, segmentSize: segmentSize)
-                let processTime = Date().timeIntervalSince(audioProcessingStart)
+                let processTime = CFAbsoluteTimeGetCurrent() - audioProcessingStart
                 timings.audioProcessing += processTime
                 timings.totalAudioProcessingRuns += 1
 
                 try Task.checkCancellation()
-                let melStart = Date()
+                let melStart = CFAbsoluteTimeGetCurrent()
                 guard let melOutput = try await featureExtractor.logMelSpectrogram(fromAudio: audioSamples) else {
                     throw WhisperError.transcriptionFailed("Mel output is nil")
                 }
-                let melTime = Date().timeIntervalSince(melStart)
+                let melTime = CFAbsoluteTimeGetCurrent() - melStart
                 timings.logmels += melTime
                 timings.totalLogmelRuns += 1
 
                 try Task.checkCancellation()
-                let encoderStart = Date()
+                let encoderStart = CFAbsoluteTimeGetCurrent()
                 guard let encoderOutput = try await audioEncoder.encodeFeatures(melOutput) else {
                     throw WhisperError.transcriptionFailed("Encoder output is nil")
                 }
-                let encoderTime = Date().timeIntervalSince(encoderStart)
+                let encoderTime = CFAbsoluteTimeGetCurrent() - encoderStart
                 timings.encoding += encoderTime
                 timings.totalEncodingRuns += 1
 
@@ -177,7 +177,7 @@ open class TranscribeTask {
                 // MARK: Windowing
 
                 // At this point we have a completed window aka segment
-                let windowingStart = Date()
+                let windowingStart = CFAbsoluteTimeGetCurrent()
 
                 let previousSeek = seek
                 var (newSeek, currentSegments) = segmentSeeker.findSeekPointAndSegments(
@@ -199,7 +199,7 @@ open class TranscribeTask {
                 if options.wordTimestamps,
                    let alignmentWeights = decodingResult.cache?.alignmentWeights
                 {
-                    let wordTimestampsStart = Date()
+                    let wordTimestampsStart = CFAbsoluteTimeGetCurrent()
                     currentSegments = try segmentSeeker.addWordTimestamps(
                         segments: currentSegments ?? [],
                         alignmentWeights: alignmentWeights,
@@ -213,7 +213,7 @@ open class TranscribeTask {
                         timings: timings
                     )
 
-                    timings.decodingWordTimestamps += Date().timeIntervalSince(wordTimestampsStart)
+                    timings.decodingWordTimestamps += CFAbsoluteTimeGetCurrent() - wordTimestampsStart
                     timings.totalTimestampAlignmentRuns += 1
 
                     // Filter out zero length segments
@@ -266,7 +266,7 @@ open class TranscribeTask {
                 let allCurrentTokens = processedSegments.flatMap { $0.tokens }
                 allTokens.append(contentsOf: allCurrentTokens)
 
-                timings.decodingWindowing += Date().timeIntervalSince(windowingStart)
+                timings.decodingWindowing += CFAbsoluteTimeGetCurrent() - windowingStart
                 timings.totalDecodingWindows += 1
 
                 // Reset cache and move on to the next window
@@ -303,7 +303,7 @@ open class TranscribeTask {
 
             for (i, temp) in temperatures.enumerated() {
                 Logging.info("Decoding Temperature: \(temp)")
-                let decodeWithFallbackStart = Date()
+                let decodeWithFallbackStart = CFAbsoluteTimeGetCurrent()
 
                 let tokenSampler = GreedyTokenSampler(temperature: temp, eotToken: tokenizer.specialTokens.endToken, decodingOptions: options)
 
@@ -365,7 +365,7 @@ open class TranscribeTask {
                 if let fallback = decodingResult?.fallback, fallback.needsFallback {
                     // Reset decoder inputs for fallback
                     fallbackCount = i
-                    timings.decodingFallback += Date().timeIntervalSince(decodeWithFallbackStart)
+                    timings.decodingFallback += CFAbsoluteTimeGetCurrent() - decodeWithFallbackStart
                     timings.totalDecodingFallbacks = Double(fallbackCount)
                     decoderInputs.reset(
                         prefilledCacheSize: prefilledCacheSize,

@@ -419,30 +419,49 @@ public extension TextDecoding {
         let sliceShape = keySlice.shape.map { $0.intValue }
         let sliceStrides = keySlice.strides.map { $0.intValue } // same for val
         let bytesPerSample = MemoryLayout<FloatType>.size
+        let embedDim = tensorShape[1]
+        let sliceSeqLen = sliceShape[3]
 
         keyTensor.withUnsafeMutableBytes { keyTensorPointer, keyTargetStrides in
             keySlice.withUnsafeBytes { keySlicePointer in
                 valueTensor.withUnsafeMutableBytes { valueTensorPointer, valueTargetStrides in
                     valueSlice.withUnsafeBytes { valueSlicePointer in
-                        // Assuming batch size is always 1
-                        DispatchQueue.concurrentPerform(iterations: tensorShape[1]) { j in
-                            // Slice size is 3 for prefill and 1 for decode loops
-                            for k in 0..<sliceShape[3] {
-                                // Equivalent to:
-                                // `tensor[0, j, 0, k + index] = slice[0, j, 0, k + index]`
-                                let keyDestIndex = j * keyTargetStrides[1] + (index + k) * keyTargetStrides[3]
+                        // For single-token decode (sliceSeqLen == 1), GCD overhead
+                        // far exceeds the cost of copying ~768 bytes sequentially.
+                        if sliceSeqLen == 1 {
+                            for j in 0..<embedDim {
+                                let keyDestIndex = j * keyTargetStrides[1] + index * keyTargetStrides[3]
                                 let keyDest = keyTensorPointer.baseAddress! + keyDestIndex * bytesPerSample
 
-                                let keySliceIndex = j * sliceStrides[1] + k * sliceStrides[3]
+                                let keySliceIndex = j * sliceStrides[1]
                                 let keySlice = keySlicePointer.baseAddress! + keySliceIndex * bytesPerSample
                                 memcpy(keyDest, keySlice, bytesPerSample)
 
-                                let valDestIndex = j * valueTargetStrides[1] + (index + k) * valueTargetStrides[3]
+                                let valDestIndex = j * valueTargetStrides[1] + index * valueTargetStrides[3]
                                 let valDest = valueTensorPointer.baseAddress! + valDestIndex * bytesPerSample
 
-                                let valSliceIndex = j * sliceStrides[1] + k * sliceStrides[3]
+                                let valSliceIndex = j * sliceStrides[1]
                                 let valSlice = valueSlicePointer.baseAddress! + valSliceIndex * bytesPerSample
                                 memcpy(valDest, valSlice, bytesPerSample)
+                            }
+                        } else {
+                            // Prefill path: slice size > 1, use GCD for parallelism
+                            DispatchQueue.concurrentPerform(iterations: embedDim) { j in
+                                for k in 0..<sliceSeqLen {
+                                    let keyDestIndex = j * keyTargetStrides[1] + (index + k) * keyTargetStrides[3]
+                                    let keyDest = keyTensorPointer.baseAddress! + keyDestIndex * bytesPerSample
+
+                                    let keySliceIndex = j * sliceStrides[1] + k * sliceStrides[3]
+                                    let keySlice = keySlicePointer.baseAddress! + keySliceIndex * bytesPerSample
+                                    memcpy(keyDest, keySlice, bytesPerSample)
+
+                                    let valDestIndex = j * valueTargetStrides[1] + (index + k) * valueTargetStrides[3]
+                                    let valDest = valueTensorPointer.baseAddress! + valDestIndex * bytesPerSample
+
+                                    let valSliceIndex = j * sliceStrides[1] + k * sliceStrides[3]
+                                    let valSlice = valueSlicePointer.baseAddress! + valSliceIndex * bytesPerSample
+                                    memcpy(valDest, valSlice, bytesPerSample)
+                                }
                             }
                         }
                     }
@@ -457,22 +476,18 @@ public extension TextDecoding {
         insertAtIndex tokenIndex: Int
     ) {
         let tensorShape = alignmentTensor.shape.map { $0.intValue }
-        let sliceStrides = alignmentSlice.strides.map { $0.intValue }
+        let columnCount = tensorShape[1]
         let bytesPerSample = MemoryLayout<FloatType>.size
 
         alignmentTensor.withUnsafeMutableBytes { alignmentPointer, alignmentStrides in
             alignmentSlice.withUnsafeBytes { slicePointer in
-                // Process each column
-                for column in 0..<tensorShape[1] {
-                    // Calculate source and destination indices
-                    let destIndex = (tokenIndex + 1) * alignmentStrides[0] + column * alignmentStrides[1]
-                    let sourceIndex = column * sliceStrides[1]
-
-                    // Copy the weight value
-                    let dest = alignmentPointer.baseAddress! + destIndex * bytesPerSample
-                    let source = slicePointer.baseAddress! + sourceIndex * bytesPerSample
-                    memcpy(dest, source, bytesPerSample)
-                }
+                // Single memcpy for the entire row instead of per-element copies.
+                // The slice is contiguous (1D of columnCount elements), and the
+                // destination row in the tensor is also contiguous when stride[1]==1.
+                let destOffset = (tokenIndex + 1) * alignmentStrides[0] * bytesPerSample
+                let dest = alignmentPointer.baseAddress! + destOffset
+                let source = slicePointer.baseAddress!
+                memcpy(dest, source, columnCount * bytesPerSample)
             }
         }
     }
@@ -488,7 +503,7 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
     public var prefillData: WhisperMLModel?
     public var isModelMultilingual: Bool = false
     public var logitsFilters: [any LogitsFiltering]? = []
-    private let earlyStopActor = EarlyStopActor()
+    private let earlyStopLock = EarlyStopLock()
     private var languageLogitsFilter: LanguageLogitsFilter?
 
     public init() {}
@@ -648,7 +663,7 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
         // MARK: Decoding Inference
 
         // Predict next token
-        let inferenceTime = Date()
+        let inferenceTime = CFAbsoluteTimeGetCurrent()
 
         Logging.debug("Detecting language...")
         guard let encoderOutput = encoderOutput as? MLMultiArray else {
@@ -674,7 +689,7 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
             throw WhisperError.decodingLogitsFailed()
         }
 
-        let decodingInferenceTime = Date().timeIntervalSince(inferenceTime)
+        let decodingInferenceTime = CFAbsoluteTimeGetCurrent() - inferenceTime
         timings.decodingPredictions += decodingInferenceTime
 
         // MARK: Non-inference
@@ -684,14 +699,14 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
 
         // MARK: Sampling
 
-        let samplingStartTime = Date()
+        let samplingStartTime = CFAbsoluteTimeGetCurrent()
 
         let sampleResult = tokenSampler.update(tokens: currentTokens, logits: logits, logProbs: logProbs)
 
         nextToken = sampleResult.tokens.last!
         logProbs = sampleResult.logProbs
 
-        let samplingTime = Date().timeIntervalSince(samplingStartTime)
+        let samplingTime = CFAbsoluteTimeGetCurrent() - samplingStartTime
         timings.decodingSampling += samplingTime
 
         var languageProbs = [String: Float]()
@@ -739,6 +754,14 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
             throw WhisperError.tokenizerUnavailable()
         }
 
+        guard let decoderInputs = decoderInputs as? DecodingInputs else {
+            throw WhisperError.prepareDecoderInputsFailed("DecodingInputsType must be DecodingInputs")
+        }
+
+        guard let encoderOutput = encoderOutput as? MLMultiArray else {
+            throw WhisperError.prepareDecoderInputsFailed("Input must be MLMultiArray")
+        }
+
         // Single loop variables
         var timings = TranscriptionTimings()
         let prefilledIndex = decoderInputs.cacheLength[0].intValue
@@ -750,6 +773,18 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
         // Logits filters
         let logitsFilters = createLogitsFilters(options: options, prefilledIndex: prefilledIndex, initialPromptIndex: initialPromptIndex, tokenizer: tokenizer)
 
+        // Pre-allocate reusable objects outside the hot loop
+        let reusableModelInput = TextDecoderInput(
+            input_ids: decoderInputs.inputIds,
+            cache_length: decoderInputs.cacheLength,
+            key_cache: decoderInputs.keyCache,
+            value_cache: decoderInputs.valueCache,
+            kv_cache_update_mask: decoderInputs.kvCacheUpdateMask,
+            encoder_output_embeds: encoderOutput,
+            decoder_key_padding_mask: decoderInputs.decoderKeyPaddingMask
+        )
+        let reusablePredictionOptions = MLPredictionOptions()
+
         // MARK: Main loop
 
         let loopCount = min(options.sampleLength, Constants.maxTokenContext - 1)
@@ -757,10 +792,10 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
         var hasAlignment = false
         var isFirstTokenLogProbTooLow = false
         let windowUUID = UUID()
-        await earlyStopActor.set(false, for: windowUUID)
+        earlyStopLock.set(false, for: windowUUID)
 
         for tokenIndex in prefilledIndex..<loopCount {
-            let loopStart = Date()
+            let loopStart = CFAbsoluteTimeGetCurrent()
 
             let isPrefill = tokenIndex < initialPromptIndex - 1 // Prefill stops at the last token of the initial prompt
             let isLastPrefillToken = tokenIndex == initialPromptIndex - 1
@@ -782,10 +817,6 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
                 }
             }
 
-            guard let decoderInputs = decoderInputs as? DecodingInputs else {
-                throw WhisperError.prepareDecoderInputsFailed("DecodingInputsType must be DecodingInputs")
-            }
-
             // Set the current token as model input
             decoderInputs.inputIds[0] = NSNumber(value: nextToken)
             decoderInputs.cacheLength[0] = NSNumber(value: tokenIndex)
@@ -796,47 +827,37 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
 
             // MARK: Decoding Inference
 
-            // Predict next token
-            let inferenceTime = Date()
+            // Predict next token — reuse pre-allocated input and options
+            let inferenceTime = CFAbsoluteTimeGetCurrent()
 
-            guard let encoderOutput = encoderOutput as? MLMultiArray else {
-                throw WhisperError.prepareDecoderInputsFailed("Input must be MLMultiArray")
-            }
-            let predictedLogits = try await self.predictLogits(
-                TextDecoderMLMultiArrayInputType(
-                    inputIds: decoderInputs.inputIds,
-                    cacheLength: decoderInputs.cacheLength,
-                    keyCache: decoderInputs.keyCache,
-                    valueCache: decoderInputs.valueCache,
-                    kvCacheUpdateMask: decoderInputs.kvCacheUpdateMask,
-                    encoderOutputEmbeds: encoderOutput,
-                    decoderKeyPaddingMask: decoderInputs.decoderKeyPaddingMask
-                )
-            ) as? TextDecoderMLMultiArrayOutputType
-
-            guard let decoderOutput = predictedLogits else {
-                throw WhisperError.decodingLogitsFailed("Unable to decode logits")
+            guard let model = model else {
+                throw WhisperError.decodingLogitsFailed("Model is nil")
             }
 
-            let decodingInferenceTime = Date().timeIntervalSince(inferenceTime)
+            try Task.checkCancellation()
+
+            let outputFeatures = try await model.asyncPrediction(from: reusableModelInput, options: reusablePredictionOptions)
+            let output = TextDecoderOutput(features: outputFeatures)
+
+            let decodingInferenceTime = CFAbsoluteTimeGetCurrent() - inferenceTime
             timings.decodingPredictions += decodingInferenceTime
 
             // MARK: Non-inference
 
-            let nonInferenceStartTime = Date()
+            let nonInferenceStartTime = CFAbsoluteTimeGetCurrent()
 
             // Update predicted token as current
-            var logits = decoderOutput.logits!
+            var logits = output.logits
             for filter in logitsFilters {
                 logits = filter.filterLogits(logits, withTokens: currentTokens)
             }
 
-            let filteringTime = Date().timeIntervalSince(nonInferenceStartTime)
+            let filteringTime = CFAbsoluteTimeGetCurrent() - nonInferenceStartTime
             timings.decodingFiltering += filteringTime
 
             // MARK: Sampling
 
-            let samplingStartTime = Date()
+            let samplingStartTime = CFAbsoluteTimeGetCurrent()
 
             let sampleResult = tokenSampler.update(tokens: currentTokens, logits: logits, logProbs: logProbs)
 
@@ -845,7 +866,7 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
 
             Logging.debug("Predicted next tokenIndex: \(tokenIndex + 1), token: \(nextToken), text: \(tokenizer.decode(tokens: [nextToken]))")
 
-            let samplingTime = Date().timeIntervalSince(samplingStartTime)
+            let samplingTime = CFAbsoluteTimeGetCurrent() - samplingStartTime
             timings.decodingSampling += samplingTime
 
             isFirstTokenLogProbTooLow =
@@ -861,8 +882,8 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
 
             if isSegmentCompleted {
                 // Completed segment, stop the loop
-                timings.decodingNonPrediction += Date().timeIntervalSince(nonInferenceStartTime)
-                timings.decodingLoop += Date().timeIntervalSince(loopStart)
+                timings.decodingNonPrediction += CFAbsoluteTimeGetCurrent() - nonInferenceStartTime
+                timings.decodingLoop += CFAbsoluteTimeGetCurrent() - loopStart
                 timings.totalDecodingLoops += 1
                 break
             } else {
@@ -875,15 +896,11 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
                 }
 
                 // Update KV cache for this token
-                guard let decoderCache = decoderOutput.cache,
-                      let newKeyCache = decoderCache.keyCache,
-                      let newValueCache = decoderCache.valueCache
-                else {
-                    fatalError("Invalid model output")
-                }
+                let newKeyCache = output.key_cache_updates
+                let newValueCache = output.value_cache_updates
 
                 // tensor: [1, kvCacheEmbedDim, 1, kvCacheMaxSequenceLength], slice: [1, kvCacheEmbedDim, 1, 1]
-                let kvStartTime = Date()
+                let kvStartTime = CFAbsoluteTimeGetCurrent()
                 TextDecoder.updateKVCache(keyTensor: decoderInputs.keyCache,
                                           keySlice: newKeyCache,
                                           valueTensor: decoderInputs.valueCache,
@@ -896,7 +913,7 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
                 decoderInputs.kvCacheUpdateMask[tokenIndex + 1] = 1
 
                 // Update alignment weights for token if present
-                if let newAlignmentWeights = decoderOutput.cache?.alignmentWeights {
+                if let newAlignmentWeights = output.alignment_heads_weights {
                     hasAlignment = true
                     TextDecoder.updateAlignmentWeights(
                         alignmentTensor: decoderInputs.alignmentWeights,
@@ -905,7 +922,7 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
                     )
                 }
 
-                let kvTime = Date().timeIntervalSince(kvStartTime)
+                let kvTime = CFAbsoluteTimeGetCurrent() - kvStartTime
                 timings.decodingKvCaching += kvTime
                 timings.totalKVUpdateRuns += 1
 
@@ -918,38 +935,33 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
 
                 let result = TranscriptionProgress(timings: timings, text: currentTranscript, tokens: currentTokens, avgLogprob: averageLogProb, compressionRatio: compressionRatio)
 
-                // Call the callback if it is provided on a background thread
+                // Call the callback if it is provided
                 if let callback = callback {
-                    Task.detached(priority: .low) { [weak self] in
-                        guard let self = self else { return }
-                        let shouldContinue = callback(result)
-                        if let shouldContinue = shouldContinue, !shouldContinue, !isPrefill {
-                            Logging.debug("Early stopping")
-                            await self.earlyStopActor.set(true, for: windowUUID)
-                        }
+                    let shouldContinue = callback(result)
+                    if let shouldContinue = shouldContinue, !shouldContinue, !isPrefill {
+                        Logging.debug("Early stopping")
+                        earlyStopLock.set(true, for: windowUUID)
                     }
                 }
             }
 
-            timings.decodingNonPrediction += Date().timeIntervalSince(nonInferenceStartTime)
-            timings.decodingLoop += Date().timeIntervalSince(loopStart)
+            timings.decodingNonPrediction += CFAbsoluteTimeGetCurrent() - nonInferenceStartTime
+            timings.decodingLoop += CFAbsoluteTimeGetCurrent() - loopStart
             timings.totalDecodingLoops += 1
 
             if tokenIndex == prefilledIndex {
-                Logging.debug("Found first token at: \(Date())")
+                Logging.debug("Found first token")
                 timings.firstTokenTime = CFAbsoluteTimeGetCurrent()
             }
 
             // Check if early stopping is triggered
-            if await earlyStopActor.get(for: windowUUID) {
+            if earlyStopLock.get(for: windowUUID) {
                 break
             }
         }
 
         // Cleanup after loop completion
-        if await earlyStopActor.remove(for: windowUUID) == nil {
-            Logging.error("Early stop flag not found for window: \(windowUUID)")
-        }
+        earlyStopLock.remove(for: windowUUID)
 
         var cache: DecodingCache?
         if let inputs = decoderInputs as? DecodingInputs {

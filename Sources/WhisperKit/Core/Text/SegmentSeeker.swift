@@ -201,68 +201,63 @@ open class SegmentSeeker: SegmentSeeking {
             throw WhisperError.segmentingFailed("Invalid alignment matrix shape")
         }
 
-        // Initialize cost matrix and trace matrix
-        var costMatrix = Array(repeating: Array(repeating: Double.infinity, count: numberOfColumns + 1), count: numberOfRows + 1)
-        var traceMatrix = Array(repeating: Array(repeating: -1, count: numberOfColumns + 1), count: numberOfRows + 1)
+        let costRows = numberOfRows + 1
+        let costCols = numberOfColumns + 1
 
-        costMatrix[0][0] = 0
+        // Use flat contiguous buffers instead of jagged arrays for cache-friendly access
+        var costBuffer = [Double](repeating: Double.infinity, count: costRows * costCols)
+        var traceBuffer = [Int8](repeating: -1, count: costRows * costCols)
+
+        costBuffer[0] = 0 // costMatrix[0][0]
         for i in 1...numberOfColumns {
-            traceMatrix[0][i] = 2
+            traceBuffer[i] = 2 // traceMatrix[0][i]
         }
         for i in 1...numberOfRows {
-            traceMatrix[i][0] = 1
+            traceBuffer[i * costCols] = 1 // traceMatrix[i][0]
         }
 
         for row in 1...numberOfRows {
+            let rowOffset = row * costCols
+            let prevRowOffset = (row - 1) * costCols
+            let matrixRowOffset = (row - 1) * numberOfColumns
             for column in 1...numberOfColumns {
-                let matrixValue = -matrix[(row - 1) * numberOfColumns + (column - 1)].doubleValue
-                let costDiagonal = costMatrix[row - 1][column - 1]
-                let costUp = costMatrix[row - 1][column]
-                let costLeft = costMatrix[row][column - 1]
+                let matrixValue = -matrix[matrixRowOffset + (column - 1)].doubleValue
+                let costDiagonal = costBuffer[prevRowOffset + column - 1]
+                let costUp = costBuffer[prevRowOffset + column]
+                let costLeft = costBuffer[rowOffset + column - 1]
 
-                let (computedCost, traceValue) = minCostAndTrace(
-                    costDiagonal: costDiagonal,
-                    costUp: costUp,
-                    costLeft: costLeft,
-                    matrixValue: matrixValue
-                )
+                let c0 = costDiagonal + matrixValue
+                let c1 = costUp + matrixValue
+                let c2 = costLeft + matrixValue
 
-                costMatrix[row][column] = computedCost
-                traceMatrix[row][column] = traceValue
+                let idx = rowOffset + column
+                if c0 < c1 && c0 < c2 {
+                    costBuffer[idx] = c0
+                    traceBuffer[idx] = 0
+                } else if c1 < c0 && c1 < c2 {
+                    costBuffer[idx] = c1
+                    traceBuffer[idx] = 1
+                } else {
+                    costBuffer[idx] = c2
+                    traceBuffer[idx] = 2
+                }
             }
         }
 
-        let dtw = backtrace(fromTraceMatrix: traceMatrix)
-
-        return dtw
-    }
-
-    func minCostAndTrace(costDiagonal: Double, costUp: Double, costLeft: Double, matrixValue: Double) -> (Double, Int) {
-        let c0 = costDiagonal + matrixValue
-        let c1 = costUp + matrixValue
-        let c2 = costLeft + matrixValue
-
-        if c0 < c1 && c0 < c2 {
-            return (c0, 0)
-        } else if c1 < c0 && c1 < c2 {
-            return (c1, 1)
-        } else {
-            return (c2, 2)
-        }
-    }
-
-    func backtrace(fromTraceMatrix traceMatrix: [[Int]]) -> (textIndices: [Int], timeIndices: [Int]) {
-        var i = traceMatrix.count - 1
-        var j = traceMatrix[0].count - 1
+        // Backtrace using the flat buffer
+        var i = costRows - 1
+        var j = costCols - 1
 
         var textIndices = [Int]()
         var timeIndices = [Int]()
+        textIndices.reserveCapacity(i + j)
+        timeIndices.reserveCapacity(i + j)
 
         while i > 0 || j > 0 {
             textIndices.append(i - 1)
             timeIndices.append(j - 1)
 
-            switch traceMatrix[i][j] {
+            switch traceBuffer[i * costCols + j] {
                 case 0:
                     i -= 1
                     j -= 1
