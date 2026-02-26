@@ -46,6 +46,16 @@ for model in tiny base small large-v2 large-v3; do
 done
 ```
 
+### Benchmark script
+
+Run all models against short and long audio:
+
+```bash
+./scripts/benchmark.sh --all
+```
+
+See `./scripts/benchmark.sh --help` for options like `--audio`, `--models`, and `--long`.
+
 The `--verbose` flag prints tokens per second, real-time factor, and speed factor after each transcription.
 
 ## License

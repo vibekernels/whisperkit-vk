@@ -1,6 +1,7 @@
 .PHONY: setup setup-huggingface-cli setup-model-repo download-models download-model build build-cli test \
  		clean-package-caches list-devices benchmark-connected-devices benchmark-device benchmark-devices \
-		extract-xcresult build-local-server generate-server generate-server-spec generate-server-code
+		extract-xcresult build-local-server generate-server generate-server-spec generate-server-code \
+		benchmark
 
 PIP_COMMAND := pip3
 PYTHON_COMMAND := python3
@@ -130,6 +131,9 @@ benchmark-devices: generate-whisperax-xcconfig
 upload-benchmark-results:
 	@echo "Uploading benchmark results..."
 	@fastlane upload_results
+
+benchmark: build-cli
+	@./scripts/benchmark.sh --all
 
 clean-package-caches:
 	@trash ~/Library/Developer/Xcode/DerivedData/WhisperKit* || true
