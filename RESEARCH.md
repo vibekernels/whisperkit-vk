@@ -124,6 +124,33 @@ Attempted to overlap audio encoder (Neural Engine) with text decoder (GPU) acros
 - **Problem 2:** VAD chunking produces single-window chunks, eliminating pipelining opportunity
 - **Reverted** — no benefit for typical audio
 
+## Batched Decoding Feasibility (Investigated — Not Viable)
+
+whisper.cpp achieves 5.7ms/tok via batched decoding (multiple tokens per forward pass), while WhisperKit gets ~62ms/tok with autoregressive single-token decoding — a 10.8x per-token gap. Investigated whether the same approach could be applied to WhisperKit.
+
+**Finding: CoreML models are incompatible with batched decoding.**
+
+The WhisperKit CoreML text decoder models are compiled with fixed single-token input shapes and zero shape flexibility:
+
+| Input/Output | Shape | Constraint |
+|---|---|---|
+| `input_ids` | `[1]` (scalar Int32) | Not `[1, N]` — single token only |
+| `logits` output | `[1, 1, 51865]` | Single position output |
+| `key_cache_updates` | `[1, 40960, 1, 1]` | Single token KV slice |
+| `kv_cache_update_mask` | One `1` value per pass | Single token insertion |
+| Model metadata | `hasShapeFlexibility: "0"` | All inputs fixed |
+
+The model literally cannot accept more than one token per forward pass. Enabling batched decoding would require:
+
+1. **Re-export PyTorch → CoreML** with flexible batch dimension on `input_ids` (`[1, N]`), logits (`[1, N, vocab_size]`), and KV cache updates (`[1, embed_dim, 1, N]`)
+2. **Modify attention mechanism** in the model to compute N parallel queries
+3. **Update Swift decode loop** — batch token sampling, N-token KV cache inserts
+4. **Rebuild and redistribute all model artifacts** on HuggingFace (`argmaxinc/whisperkit-coreml`)
+
+This is a model architecture + export change, not a code optimization. WhisperKit consumes pre-built CoreML models — the re-export would need to happen upstream in the model conversion pipeline.
+
+**Conclusion:** The batched decoding speed gap is a model format limitation. No code changes in this repo can address it.
+
 ## Remaining Opportunities
 
 ### Speculative Decoding
