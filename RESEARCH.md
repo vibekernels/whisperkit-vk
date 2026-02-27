@@ -1,6 +1,24 @@
 # WhisperKit Transcription Speed Research
 
-## Hardware
+## Cross-Engine Comparison (10 GPU core Mac)
+
+Benchmarks on Apple Silicon (10 GPU cores), ted_60.m4a (60s), macOS, release builds.
+
+| Engine | Model | Backend | Total Time | Speed Factor | RTF |
+|---|---|---|---|---|---|
+| FluidAudio 0.7.9 | parakeet-tdt-0.6b-v3 (CoreML) | ANE | **0.39s** | **151.9x** | 0.007 |
+| whisper.cpp 1.8.3 | large-v2 (GGML) | Metal GPU | 12.4s | 4.8x | 0.21 |
+| WhisperKit (repo) | large-v2 (CoreML) | ANE | 14.7s | 4.1x | 0.24 |
+| WhisperKit (repo) | large-v2 (CoreML) | GPU | 27.2s | 2.2x | 0.45 |
+
+**Key takeaways:**
+- **FluidAudio's Parakeet TDT is ~32x faster than whisper.cpp** and ~38x faster than WhisperKit on the same hardware. Parakeet is non-autoregressive (0.6B params) vs Whisper's autoregressive decoding (1.5B params) — a fundamentally different architecture.
+- **whisper.cpp is ~18% faster than WhisperKit** on large-v2. whisper.cpp uses Metal GPU with **batched decoding** (multiple tokens per forward pass, 5.7ms/tok for 1358 tokens), while WhisperKit uses CoreML with **autoregressive decoding** (one token per forward pass, ~62ms/tok). Batched decoding reads the ~1.5GB weight matrix once per batch rather than once per token, amortizing the memory bandwidth cost. whisper.cpp has no ANE access (custom GGML Metal shaders, not CoreML). The ~10.8x per-token advantage is partially offset by a slower encoder (2.85s vs WhisperKit's faster CoreML encoder), netting ~18% end-to-end.
+- **WhisperKit ANE (4.1x RT) is competitive with whisper.cpp Metal GPU (4.8x RT)** despite autoregressive decoding, because the ANE has a different memory subsystem optimized for sequential inference workloads.
+- **ANE is ~85% faster than GPU** for WhisperKit's CoreML text decoder on 10-core Macs (opposite of high-core Macs — see below).
+- Transcription quality is comparable across all engines. FluidAudio captures slightly more filler words ("uh") and has better punctuation.
+
+## M1 Max Hardware (32 GPU cores)
 
 Apple M1 Max (32 GPU cores, 10 CPU cores, ~400 GB/s memory bandwidth)
 Audio: ted_60.m4a (60s TED talk clip)
@@ -42,6 +60,15 @@ The turbo model (4 decoder layers) is **5.5x faster** than large-v2 (32 decoder 
 
 **Finding:** The previous auto-selection only chose cpuAndGPU for "large" models. GPU is faster for ALL model sizes on ≥14 GPU core Macs. Fixed in `TranscribeCLIUtils.swift`.
 
+### ANE vs GPU is Hardware-Dependent (10 GPU core Mac)
+
+| Compute Units | Tok/s | Notes |
+|--------------|-------|-------|
+| cpuAndNeuralEngine | 16.14 | Best — ANE wins on low-core Macs |
+| cpuAndGPU | 8.44 | ~48% slower |
+
+**Finding:** The GPU vs ANE preference reverses on lower-core Macs. On ≥14 GPU cores, GPU wins (+43%). On 10 GPU cores, ANE wins (+85%). The auto-selection threshold of 14 cores is well-calibrated — but the current code also forces `cpuAndGPU` for all large models regardless of core count (`else if large`), which hurts 10-core Macs.
+
 ### Other CLI Settings
 
 | Setting | Tok/s | Notes |
@@ -76,6 +103,10 @@ Net impact on large-v2: ~1-2% (within noise, CoreML dominates). Significant for 
 - **Added modelPath fallback** for model name detection when --model-path is used without --model
 - Impact: **+22-43% faster** for turbo/distil models that were incorrectly using Neural Engine
 
+### 3. Micro-Optimizations Attempted (Reverted — No Measurable Impact)
+
+Tested eliminating per-token array copies in `GreedyTokenSampler.update()` (returning single-element arrays instead of rebuilding full accumulated arrays) and gating progress callback computation behind nil check. A/B benchmark (3 runs each, ANE, large-v2) showed identical performance: origin avg 16.09 tok/s vs optimized avg 16.09 tok/s. Changes reverted as the per-token overhead is dominated by CoreML inference (~62ms/token), not array operations or string formatting (~microseconds).
+
 ## CoreML Configuration Experiments (All Negative)
 
 | Setting | Result | Notes |
@@ -107,7 +138,9 @@ Attempted to overlap audio encoder (Neural Engine) with text decoder (GPU) acros
 - WhisperKit has MLState/MLTensor infrastructure but not used in main inference path
 
 ### Recommendations
-1. **For speed:** Use `large-v3-v20240930_turbo` — 5.5x faster than large-v2 with near-identical English quality
-2. **For balanced speed/quality:** Use `distil-large-v3` — 4.6x faster, excellent quality
-3. **For max quality:** Use `large-v2` or `large-v3` — 14 tok/s, best multilingual support
-4. **Avoid quantized models** on GPU-rich Macs — CoreML's native float16 is faster than int8 dequantization
+1. **For maximum speed:** FluidAudio's Parakeet TDT is ~32-38x faster than Whisper with comparable quality (non-autoregressive architecture)
+2. **For Whisper speed:** Use `large-v3-v20240930_turbo` — 5.5x faster than large-v2 with near-identical English quality
+3. **For balanced speed/quality:** Use `distil-large-v3` — 4.6x faster, excellent quality
+4. **For max quality:** Use `large-v2` or `large-v3` — 14 tok/s, best multilingual support
+5. **Avoid quantized models** on GPU-rich Macs — CoreML's native float16 is faster than int8 dequantization
+6. **Fix auto-selection for <14 GPU core Macs** — the `else if large` branch forces cpuAndGPU which is ~48% slower than ANE on these machines
