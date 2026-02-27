@@ -1,6 +1,12 @@
 This is an experimental fork of [WhisperKit](https://github.com/argmaxinc/WhisperKit) with AI-driven optimizations. It is not intended for production use.
 
-## Build
+## Install
+
+```bash
+brew install vibekernels/tap/whisperkit-vk-cli
+```
+
+## Build from source
 
 ```bash
 swift build
