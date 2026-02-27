@@ -794,6 +794,13 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
         let windowUUID = UUID()
         earlyStopLock.set(false, for: windowUUID)
 
+        // Hoist invariants outside the hot loop
+        let isDebugLogging = Logging.shared.logLevel.shouldLog(level: .debug)
+        let hasCallback = callback != nil
+        guard let model = model else {
+            throw WhisperError.decodingLogitsFailed("Model is nil")
+        }
+
         for tokenIndex in prefilledIndex..<loopCount {
             let loopStart = CFAbsoluteTimeGetCurrent()
 
@@ -809,11 +816,15 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
                 // Force the token unless it's the last prefill token and both are timestamps
                 if !(isLastPrefillToken && isTimestampToken && modelPredictedTimestamp) {
                     nextToken = currentTokens[tokenIndex]
-                    Logging.debug("Forcing prompt tokenIndex: \(tokenIndex), token: \(nextToken), text: \(tokenizer.decode(tokens: [nextToken]))")
+                    if isDebugLogging {
+                        Logging.debug("Forcing prompt tokenIndex: \(tokenIndex), token: \(nextToken), text: \(tokenizer.decode(tokens: [nextToken]))")
+                    }
                 } else {
                     // Last prefill was a timestamp but the model predicted a timestamp
                     currentTokens[tokenIndex] = nextToken
-                    Logging.debug("Skipping prompt tokenIndex: \(tokenIndex), token: \(nextToken), text: \(tokenizer.decode(tokens: [nextToken]))")
+                    if isDebugLogging {
+                        Logging.debug("Skipping prompt tokenIndex: \(tokenIndex), token: \(nextToken), text: \(tokenizer.decode(tokens: [nextToken]))")
+                    }
                 }
             }
 
@@ -830,14 +841,15 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
             // Predict next token — reuse pre-allocated input and options
             let inferenceTime = CFAbsoluteTimeGetCurrent()
 
-            guard let model = model else {
-                throw WhisperError.decodingLogitsFailed("Model is nil")
-            }
-
             try Task.checkCancellation()
 
             let outputFeatures = try await model.asyncPrediction(from: reusableModelInput, options: reusablePredictionOptions)
-            let output = TextDecoderOutput(features: outputFeatures)
+
+            // Extract output features directly to avoid repeated string-based provider lookups
+            let outputLogits = outputFeatures.featureValue(for: "logits")!.multiArrayValue!
+            let outputKeyCacheUpdates = outputFeatures.featureValue(for: "key_cache_updates")!.multiArrayValue!
+            let outputValueCacheUpdates = outputFeatures.featureValue(for: "value_cache_updates")!.multiArrayValue!
+            let outputAlignmentWeights = outputFeatures.featureValue(for: "alignment_heads_weights")?.multiArrayValue
 
             let decodingInferenceTime = CFAbsoluteTimeGetCurrent() - inferenceTime
             timings.decodingPredictions += decodingInferenceTime
@@ -847,7 +859,7 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
             let nonInferenceStartTime = CFAbsoluteTimeGetCurrent()
 
             // Update predicted token as current
-            var logits = output.logits
+            var logits = outputLogits
             for filter in logitsFilters {
                 logits = filter.filterLogits(logits, withTokens: currentTokens)
             }
@@ -864,7 +876,9 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
             nextToken = sampleResult.tokens.last!
             let nextTokenLogProb = sampleResult.logProbs.last!
 
-            Logging.debug("Predicted next tokenIndex: \(tokenIndex + 1), token: \(nextToken), text: \(tokenizer.decode(tokens: [nextToken]))")
+            if isDebugLogging {
+                Logging.debug("Predicted next tokenIndex: \(tokenIndex + 1), token: \(nextToken), text: \(tokenizer.decode(tokens: [nextToken]))")
+            }
 
             let samplingTime = CFAbsoluteTimeGetCurrent() - samplingStartTime
             timings.decodingSampling += samplingTime
@@ -895,16 +909,12 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
                     logProbs.append(nextTokenLogProb)
                 }
 
-                // Update KV cache for this token
-                let newKeyCache = output.key_cache_updates
-                let newValueCache = output.value_cache_updates
-
                 // tensor: [1, kvCacheEmbedDim, 1, kvCacheMaxSequenceLength], slice: [1, kvCacheEmbedDim, 1, 1]
                 let kvStartTime = CFAbsoluteTimeGetCurrent()
                 TextDecoder.updateKVCache(keyTensor: decoderInputs.keyCache,
-                                          keySlice: newKeyCache,
+                                          keySlice: outputKeyCacheUpdates,
                                           valueTensor: decoderInputs.valueCache,
-                                          valueSlice: newValueCache,
+                                          valueSlice: outputValueCacheUpdates,
                                           insertAtIndex: tokenIndex)
 
                 decoderInputs.decoderKeyPaddingMask[tokenIndex + 1] = 0
@@ -913,7 +923,7 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
                 decoderInputs.kvCacheUpdateMask[tokenIndex + 1] = 1
 
                 // Update alignment weights for token if present
-                if let newAlignmentWeights = output.alignment_heads_weights {
+                if let newAlignmentWeights = outputAlignmentWeights {
                     hasAlignment = true
                     TextDecoder.updateAlignmentWeights(
                         alignmentTensor: decoderInputs.alignmentWeights,
@@ -926,18 +936,18 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
                 timings.decodingKvCaching += kvTime
                 timings.totalKVUpdateRuns += 1
 
-                // Prepare results
-                let wordTokens = currentTokens.filter { $0 < tokenizer.specialTokens.specialTokenBegin }
-                let slicedTextTokens = options.skipSpecialTokens ? wordTokens : currentTokens
-                let currentTranscript = tokenizer.decode(tokens: slicedTextTokens)
-                let averageLogProb = logProbs.reduce(0, +) / Float(logProbs.count)
-                let compressionRatio = TextUtilities.compressionRatio(of: currentTokens)
+                // Only compute progress when a callback is present to avoid
+                // expensive per-token tokenizer.decode and zlib compressionRatio
+                if hasCallback {
+                    let wordTokens = currentTokens.filter { $0 < tokenizer.specialTokens.specialTokenBegin }
+                    let slicedTextTokens = options.skipSpecialTokens ? wordTokens : currentTokens
+                    let currentTranscript = tokenizer.decode(tokens: slicedTextTokens)
+                    let averageLogProb = logProbs.reduce(0, +) / Float(logProbs.count)
+                    let compressionRatio = TextUtilities.compressionRatio(of: currentTokens)
 
-                let result = TranscriptionProgress(timings: timings, text: currentTranscript, tokens: currentTokens, avgLogprob: averageLogProb, compressionRatio: compressionRatio)
+                    let result = TranscriptionProgress(timings: timings, text: currentTranscript, tokens: currentTokens, avgLogprob: averageLogProb, compressionRatio: compressionRatio)
 
-                // Call the callback if it is provided
-                if let callback = callback {
-                    let shouldContinue = callback(result)
+                    let shouldContinue = callback!(result)
                     if let shouldContinue = shouldContinue, !shouldContinue, !isPrefill {
                         Logging.debug("Early stopping")
                         earlyStopLock.set(true, for: windowUUID)

@@ -27,6 +27,18 @@ internal class TranscribeCLIUtils {
         return (prop.takeRetainedValue() as? Int) ?? 0
     }
 
+    /// Returns the effective model name from either --model or --model-path arguments.
+    private static func effectiveModelName(_ arguments: TranscribeCLIArguments) -> String? {
+        if let model = arguments.model {
+            return model
+        }
+        // Fall back to extracting model name from the model path directory name
+        if let modelPath = arguments.modelPath {
+            return URL(fileURLWithPath: modelPath).lastPathComponent
+        }
+        return nil
+    }
+
     /// Returns true if the model name indicates a "large" variant.
     private static func isLargeModel(_ modelName: String?) -> Bool {
         guard let name = modelName?.lowercased() else { return false }
@@ -38,17 +50,22 @@ internal class TranscribeCLIUtils {
         var audioEncoderComputeUnits = arguments.audioEncoderComputeUnits.asMLComputeUnits
         var textDecoderComputeUnits = arguments.textDecoderComputeUnits.asMLComputeUnits
 
-        // Resolve auto compute units for text decoder based on hardware + model size
+        // Resolve auto compute units for text decoder based on hardware
+        // GPU text decoding is faster on Macs with high GPU core counts (≥14)
+        // for all model sizes, not just large models.
         if arguments.textDecoderComputeUnits == .auto {
             let cores = gpuCoreCount()
-            let large = isLargeModel(arguments.model)
-            if large && cores >= 14 {
+            let modelName = effectiveModelName(arguments)
+            let large = isLargeModel(modelName)
+            if cores >= 14 {
+                textDecoderComputeUnits = .cpuAndGPU
+            } else if large {
                 textDecoderComputeUnits = .cpuAndGPU
             } else {
                 textDecoderComputeUnits = .cpuAndNeuralEngine
             }
             if arguments.verbose {
-                print("[auto] Text decoder compute: \(textDecoderComputeUnits == .cpuAndGPU ? "cpuAndGPU" : "cpuAndNeuralEngine") (model large: \(large), GPU cores: \(cores))")
+                print("[auto] Text decoder compute: \(textDecoderComputeUnits == .cpuAndGPU ? "cpuAndGPU" : "cpuAndNeuralEngine") (model: \(modelName ?? "unknown"), GPU cores: \(cores))")
             }
         }
 
