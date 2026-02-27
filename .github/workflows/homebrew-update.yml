@@ -9,8 +9,14 @@ on:
     types: [ published ]
 
 jobs:
-  build-and-test:
-    runs-on: macos-latest
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14
+          - runner: macos-15
+          - runner: macos-26
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -25,50 +31,56 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: whisperkit-vk-cli-macos-arm64
+          name: whisperkit-vk-cli-${{ matrix.runner }}
           path: artifact/
 
   bottle:
     if: github.event_name == 'release'
-    runs-on: macos-latest
-    needs: build-and-test
+    runs-on: macos-15
+    needs: build
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download artifact from build job
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          name: whisperkit-vk-cli-macos-arm64
-          path: artifact/
+          path: artifacts/
 
-      - name: Package bottle
+      - name: Package bottles
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          PREFIX="$(pwd)/bottle/whisperkit-vk-cli/${VERSION}"
 
-          mkdir -p "${PREFIX}/bin"
-          cp artifact/whisperkit-vk-cli "${PREFIX}/bin/whisperkit-vk-cli"
-          chmod +x "${PREFIX}/bin/whisperkit-vk-cli"
+          bottle_tag() {
+            case "$1" in
+              macos-14) echo "arm64_sonoma" ;;
+              macos-15) echo "arm64_sequoia" ;;
+              macos-26) echo "arm64_tahoe" ;;
+            esac
+          }
 
-          # Detect macOS version for bottle tag
-          OS_VERSION=$(sw_vers -productVersion | cut -d. -f1)
-          case "${OS_VERSION}" in
-            15) BOTTLE_TAG="arm64_sequoia" ;;
-            14) BOTTLE_TAG="arm64_sonoma" ;;
-            13) BOTTLE_TAG="arm64_ventura" ;;
-            *)  BOTTLE_TAG="arm64_sonoma" ;;
-          esac
+          BOTTLE_FILES=""
+          > bottle_lines.txt
 
-          BOTTLE_NAME="whisperkit-vk-cli-${VERSION}.${BOTTLE_TAG}.bottle.tar.gz"
-          tar -czf "${BOTTLE_NAME}" -C bottle whisperkit-vk-cli
-          echo "BOTTLE_NAME=${BOTTLE_NAME}" >> "$GITHUB_ENV"
-          echo "BOTTLE_TAG=${BOTTLE_TAG}" >> "$GITHUB_ENV"
+          for RUNNER in macos-14 macos-15 macos-26; do
+            TAG=$(bottle_tag "$RUNNER")
+            PREFIX="$(pwd)/bottle-${RUNNER}/whisperkit-vk-cli/${VERSION}"
+
+            mkdir -p "${PREFIX}/bin"
+            cp "artifacts/whisperkit-vk-cli-${RUNNER}/whisperkit-vk-cli" "${PREFIX}/bin/whisperkit-vk-cli"
+            chmod +x "${PREFIX}/bin/whisperkit-vk-cli"
+
+            BOTTLE_NAME="whisperkit-vk-cli-${VERSION}.${TAG}.bottle.tar.gz"
+            tar -czf "${BOTTLE_NAME}" -C "bottle-${RUNNER}" whisperkit-vk-cli
+
+            SHA256=$(shasum -a 256 "${BOTTLE_NAME}" | cut -d' ' -f1)
+            BOTTLE_FILES="${BOTTLE_FILES} ${BOTTLE_NAME}"
+            echo "    sha256 cellar: :any_skip_relocation, ${TAG}: \"${SHA256}\"" >> bottle_lines.txt
+          done
+
+          echo "BOTTLE_FILES=${BOTTLE_FILES}" >> "$GITHUB_ENV"
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
-
-          SHA256=$(shasum -a 256 "${BOTTLE_NAME}" | cut -d' ' -f1)
-          echo "BOTTLE_SHA256=${SHA256}" >> "$GITHUB_ENV"
 
           # Compute source tarball SHA256 for the formula
           SOURCE_URL="https://github.com/vibekernels/whisperkit-vk/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
@@ -78,7 +90,9 @@ jobs:
       - name: Upload assets to release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${GITHUB_REF_NAME}" "${BOTTLE_NAME}" artifact/whisperkit-vk-cli
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" ${BOTTLE_FILES}
+          gh release upload "${GITHUB_REF_NAME}" artifacts/whisperkit-vk-cli-macos-15/whisperkit-vk-cli
 
       - name: Update homebrew-tap formula
         env:
@@ -93,7 +107,7 @@ jobs:
             echo ""
             echo "  bottle do"
             echo "    root_url \"https://github.com/vibekernels/whisperkit-vk/releases/download/${GITHUB_REF_NAME}\""
-            echo "    sha256 cellar: :any_skip_relocation, ${BOTTLE_TAG}: \"${BOTTLE_SHA256}\""
+            cat bottle_lines.txt
             echo "  end"
             exit 0
           fi
@@ -101,47 +115,33 @@ jobs:
           git clone "https://x-access-token:${TAP_TOKEN}@github.com/vibekernels/homebrew-tap.git" tap
           cd tap
 
-          cat > Formula/whisperkit-vk-cli.rb << 'FORMULA'
-          class WhisperkitVkCli < Formula
-            desc "On-device speech recognition for Apple Silicon, optimized by vibekernels"
-            homepage "https://github.com/vibekernels/whisperkit-vk"
-          FORMULA
-
-          cat >> Formula/whisperkit-vk-cli.rb << EOF
-            url "https://github.com/vibekernels/whisperkit-vk/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
-            sha256 "${SOURCE_SHA256}"
-          EOF
-
-          cat >> Formula/whisperkit-vk-cli.rb << 'FORMULA'
-            license "MIT"
-            head "https://github.com/vibekernels/whisperkit-vk.git", branch: "main"
-          FORMULA
-
-          cat >> Formula/whisperkit-vk-cli.rb << EOF
-
-            bottle do
-              root_url "https://github.com/vibekernels/whisperkit-vk/releases/download/${GITHUB_REF_NAME}"
-              sha256 cellar: :any_skip_relocation, ${BOTTLE_TAG}: "${BOTTLE_SHA256}"
-            end
-          EOF
-
-          cat >> Formula/whisperkit-vk-cli.rb << 'FORMULA'
-
-            depends_on xcode: ["15.0", :build]
-            depends_on :macos
-
-            def install
-              system "swift", "build", "-c", "release", "--product", "whisperkit-cli"
-              bin.install ".build/release/whisperkit-cli" => "whisperkit-vk-cli"
-            end
-
-            test do
-              system bin/"whisperkit-vk-cli", "--help"
-            end
-          end
-          FORMULA
-
-          sed -i '' 's/^          //' Formula/whisperkit-vk-cli.rb
+          {
+            echo 'class WhisperkitVkCli < Formula'
+            echo '  desc "On-device speech recognition for Apple Silicon, optimized by vibekernels"'
+            echo '  homepage "https://github.com/vibekernels/whisperkit-vk"'
+            echo "  url \"https://github.com/vibekernels/whisperkit-vk/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz\""
+            echo "  sha256 \"${SOURCE_SHA256}\""
+            echo '  license "MIT"'
+            echo '  head "https://github.com/vibekernels/whisperkit-vk.git", branch: "main"'
+            echo ''
+            echo '  bottle do'
+            echo "    root_url \"https://github.com/vibekernels/whisperkit-vk/releases/download/${GITHUB_REF_NAME}\""
+            cat ../bottle_lines.txt
+            echo '  end'
+            echo ''
+            echo '  depends_on xcode: ["15.0", :build]'
+            echo '  depends_on :macos'
+            echo ''
+            echo '  def install'
+            echo '    system "swift", "build", "-c", "release", "--product", "whisperkit-cli"'
+            echo '    bin.install ".build/release/whisperkit-cli" => "whisperkit-vk-cli"'
+            echo '  end'
+            echo ''
+            echo '  test do'
+            echo '    system bin/"whisperkit-vk-cli", "--help"'
+            echo '  end'
+            echo 'end'
+          } > Formula/whisperkit-vk-cli.rb
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
