@@ -37,8 +37,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build release binary
-        run: swift build -c release --product whisperkit-cli
+      - name: Download artifact from build job
+        uses: actions/download-artifact@v4
+        with:
+          name: whisperkit-vk-cli-macos-arm64
+          path: artifact/
 
       - name: Package bottle
         run: |
@@ -46,7 +49,8 @@ jobs:
           PREFIX="$(pwd)/bottle/whisperkit-vk-cli/${VERSION}"
 
           mkdir -p "${PREFIX}/bin"
-          cp "$(swift build -c release --product whisperkit-cli --show-bin-path)/whisperkit-cli" "${PREFIX}/bin/whisperkit-vk-cli"
+          cp artifact/whisperkit-vk-cli "${PREFIX}/bin/whisperkit-vk-cli"
+          chmod +x "${PREFIX}/bin/whisperkit-vk-cli"
 
           # Detect macOS version for bottle tag
           OS_VERSION=$(sw_vers -productVersion | cut -d. -f1)
@@ -71,10 +75,10 @@ jobs:
           SOURCE_SHA256=$(curl -sL "${SOURCE_URL}" | shasum -a 256 | cut -d' ' -f1)
           echo "SOURCE_SHA256=${SOURCE_SHA256}" >> "$GITHUB_ENV"
 
-      - name: Upload bottle to release
+      - name: Upload assets to release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${GITHUB_REF_NAME}" "${BOTTLE_NAME}"
+        run: gh release upload "${GITHUB_REF_NAME}" "${BOTTLE_NAME}" artifact/whisperkit-vk-cli
 
       - name: Update homebrew-tap formula
         env:
