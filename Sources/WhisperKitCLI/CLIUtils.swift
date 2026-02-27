@@ -6,7 +6,7 @@ import CoreML
 import Foundation
 
 enum ComputeUnits: String, ExpressibleByArgument, CaseIterable {
-    case all, cpuAndGPU, cpuOnly, cpuAndNeuralEngine, random
+    case all, cpuAndGPU, cpuOnly, cpuAndNeuralEngine, random, auto
     var asMLComputeUnits: MLComputeUnits {
         switch self {
             case .all: return .all
@@ -14,6 +14,7 @@ enum ComputeUnits: String, ExpressibleByArgument, CaseIterable {
             case .cpuOnly: return .cpuOnly
             case .cpuAndNeuralEngine: return .cpuAndNeuralEngine
             case .random: return Bool.random() ? .cpuAndGPU : .cpuAndNeuralEngine
+            case .auto: return .cpuAndNeuralEngine // Safe fallback; resolved in TranscribeCLIUtils
         }
     }
 }

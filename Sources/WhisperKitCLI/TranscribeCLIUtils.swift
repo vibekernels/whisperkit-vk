@@ -3,14 +3,54 @@
 
 import Foundation
 import CoreML
+import IOKit
 @preconcurrency import WhisperKit
 
 internal class TranscribeCLIUtils {
-    
+
+    /// Returns the number of GPU cores on the current device using IOKit, or 0 on failure.
+    private static func gpuCoreCount() -> Int {
+        let matching = IOServiceMatching("AGXAccelerator")
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == KERN_SUCCESS else {
+            return 0
+        }
+        defer { IOObjectRelease(iterator) }
+
+        let entry = IOIteratorNext(iterator)
+        guard entry != 0 else { return 0 }
+        defer { IOObjectRelease(entry) }
+
+        guard let prop = IORegistryEntryCreateCFProperty(entry, "gpu-core-count" as CFString, kCFAllocatorDefault, 0) else {
+            return 0
+        }
+        return (prop.takeRetainedValue() as? Int) ?? 0
+    }
+
+    /// Returns true if the model name indicates a "large" variant.
+    private static func isLargeModel(_ modelName: String?) -> Bool {
+        guard let name = modelName?.lowercased() else { return false }
+        return name.contains("large")
+    }
+
     /// Creates WhisperKit configuration from CLI arguments
     static func createWhisperKitConfig(from arguments: TranscribeCLIArguments) -> WhisperKitConfig {
         var audioEncoderComputeUnits = arguments.audioEncoderComputeUnits.asMLComputeUnits
-        let textDecoderComputeUnits = arguments.textDecoderComputeUnits.asMLComputeUnits
+        var textDecoderComputeUnits = arguments.textDecoderComputeUnits.asMLComputeUnits
+
+        // Resolve auto compute units for text decoder based on hardware + model size
+        if arguments.textDecoderComputeUnits == .auto {
+            let cores = gpuCoreCount()
+            let large = isLargeModel(arguments.model)
+            if large && cores >= 14 {
+                textDecoderComputeUnits = .cpuAndGPU
+            } else {
+                textDecoderComputeUnits = .cpuAndNeuralEngine
+            }
+            if arguments.verbose {
+                print("[auto] Text decoder compute: \(textDecoderComputeUnits == .cpuAndGPU ? "cpuAndGPU" : "cpuAndNeuralEngine") (model large: \(large), GPU cores: \(cores))")
+            }
+        }
 
         // Use gpu for audio encoder on macOS below 14
         if audioEncoderComputeUnits == .cpuAndNeuralEngine {

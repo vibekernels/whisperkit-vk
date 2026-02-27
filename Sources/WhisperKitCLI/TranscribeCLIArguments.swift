@@ -28,8 +28,8 @@ struct TranscribeCLIArguments: ParsableArguments {
     @Option(help: "Compute units for audio encoder model with {all,cpuOnly,cpuAndGPU,cpuAndNeuralEngine,random}")
     var audioEncoderComputeUnits: ComputeUnits = .cpuAndNeuralEngine
 
-    @Option(help: "Compute units for text decoder model with {all,cpuOnly,cpuAndGPU,cpuAndNeuralEngine,random}")
-    var textDecoderComputeUnits: ComputeUnits = .cpuAndNeuralEngine
+    @Option(help: "Compute units for text decoder model with {all,cpuOnly,cpuAndGPU,cpuAndNeuralEngine,random,auto}")
+    var textDecoderComputeUnits: ComputeUnits = .auto
 
     @Flag(help: "Verbose mode")
     var verbose: Bool = false
