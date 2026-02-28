@@ -374,6 +374,7 @@ The TDT model is **7.5x faster** than even the largest-chunk EOU configuration. 
 | **120M streaming model** | 7.5x slower than 0.6B TDT for offline use. Streaming architecture requires hundreds of tiny forward passes vs 4 large chunks. |
 | **iOS 18 per-channel-scale (spec bump)** | Bumping specificationVersion 8→9 unlocks `enable_per_channel_scale` for Decoder/Joint, but result is **40% slower** (442ms vs 313ms, 136x vs 192x RT). The `constexpr_blockwise_shift_scale` dequantization op adds per-call overhead that compounds across ~600 LSTM passes. Encoder can't be bumped (pre-existing iOS 17 LUT ops reject iOS 18 schema). |
 | **iOS 18 vector palettization** | `cluster_dim=2` fails with coremltools 9.0 bug: "vector_axis need to be provided" during `canonicalize_quantized_lut_pattern` pass. Must be applied during initial PyTorch conversion, not post-hoc. |
+| **iOS 18 Encoder re-export from PyTorch** | Re-exported Encoder from NeMo PyTorch with `minimum_deployment_target=ct.target.iOS18` to unlock iOS 18 palettization features. Required two-venv workflow (NeMo torch 2.10 + coremltools torch 2.7) and monkey-patching coremltools `_cast` bug. 6-bit FP16 result: **446MB compiled — same as original 8-bit (446MB)**. Speed: ~177x RT vs baseline ~180x RT (within noise). Per-channel-scale variant was **larger** (556MB). FluidAudio's original 8-bit LUT compression produces same effective binary size as 6-bit from FP16 source. **No benefit from re-export.** |
 
 ### Key Takeaways
 
@@ -382,7 +383,7 @@ The TDT model is **7.5x faster** than even the largest-chunk EOU configuration. 
 3. **Selective layer palettization doesn't help** — quality is dominated by LSTM recurrent weight precision, not embedding precision. All 4-bit LSTM configs produce identical token duplication errors regardless of embedding bit width.
 4. **3-bit is counterproductive** — slower inference AND worse quality. The `uint3` code path on ANE has higher overhead than `uint6`.
 5. **Streaming models are slower for offline use** — TDT processes 4 large chunks while streaming processes hundreds of tiny ones.
-6. **Further ANE optimization requires iOS 18+ model re-export** to unlock per-channel scale and vector palettization, which could improve accuracy at 4-bit without speed loss.
+6. **iOS 18 re-export doesn't help** — re-exported Encoder from PyTorch with iOS 18 target, but 6-bit palettization produced identical compiled size (446MB) and speed (~177x RT) to the original 8-bit. Per-channel-scale was actually larger (556MB). The original FluidAudio 8-bit LUT compression is already optimal.
 7. **The 194x RT ceiling is fundamentally set by CoreML kernel performance** on the ANE. No post-hoc model transformation can break through this barrier — it would require architectural changes (smaller model, different attention mechanism) or hardware with faster ANE throughput.
 
 ## Remaining Opportunities
