@@ -6,13 +6,13 @@ Benchmarks on Apple Silicon (10 GPU cores), ted_60.m4a (60s), macOS, release bui
 
 | Engine | Model | Backend | Total Time | Speed Factor | RTF |
 |---|---|---|---|---|---|
-| FluidAudio 0.7.9 | parakeet-tdt-0.6b-v3 (CoreML) | ANE | **0.39s** | **151.9x** | 0.007 |
+| FluidAudio 0.10.1 | parakeet-tdt-0.6b-v3 (CoreML, 6-bit decoder) | ANE | **0.31s** | **194x** | 0.005 |
 | whisper.cpp 1.8.3 | large-v2 (GGML) | Metal GPU | 12.4s | 4.8x | 0.21 |
 | WhisperKit (repo) | large-v2 (CoreML) | ANE | 14.7s | 4.1x | 0.24 |
 | WhisperKit (repo) | large-v2 (CoreML) | GPU | 27.2s | 2.2x | 0.45 |
 
 **Key takeaways:**
-- **FluidAudio's Parakeet TDT is ~32x faster than whisper.cpp** and ~38x faster than WhisperKit on the same hardware. Parakeet is non-autoregressive (0.6B params) vs Whisper's autoregressive decoding (1.5B params) — a fundamentally different architecture.
+- **FluidAudio's Parakeet TDT is ~40x faster than whisper.cpp** and ~47x faster than WhisperKit on the same hardware. Parakeet is non-autoregressive (0.6B params) vs Whisper's autoregressive decoding (1.5B params) — a fundamentally different architecture.
 - **whisper.cpp is ~18% faster than WhisperKit** on large-v2. whisper.cpp uses Metal GPU with **batched decoding** (multiple tokens per forward pass, 5.7ms/tok for 1358 tokens), while WhisperKit uses CoreML with **autoregressive decoding** (one token per forward pass, ~62ms/tok). Batched decoding reads the ~1.5GB weight matrix once per batch rather than once per token, amortizing the memory bandwidth cost. whisper.cpp has no ANE access (custom GGML Metal shaders, not CoreML). The ~10.8x per-token advantage is partially offset by a slower encoder (2.85s vs WhisperKit's faster CoreML encoder), netting ~18% end-to-end.
 - **WhisperKit ANE (4.1x RT) is competitive with whisper.cpp Metal GPU (4.8x RT)** despite autoregressive decoding, because the ANE has a different memory subsystem optimized for sequential inference workloads.
 - **ANE is ~85% faster than GPU** for WhisperKit's CoreML text decoder on 10-core Macs (opposite of high-core Macs — see below).
@@ -268,6 +268,49 @@ GPU: 620.2  619.7  620.3  619.9  621.8
 
 **Finding:** ANE is **79% faster** than GPU for Parakeet on 10-core Macs. This matches the Whisper text decoder result (ANE +85% on 10-core). Transcription output is near-identical across compute units. GPU is not a path to faster Parakeet inference on this hardware.
 
+## CoreML Model Palettization (Decoder + JointDecision)
+
+Downloaded `.mlpackage` source files from HuggingFace (`FluidInference/parakeet-tdt-0.6b-v3-coreml`) and applied weight palettization via `coremltools.optimize.coreml.palettize_weights()`.
+
+### Model weight analysis
+
+| Component | Params | Original | Already Palettized? |
+|---|---|---|---|
+| Encoder | 444M (97%) | 433MB | **Yes** — 8-bit LUT by FluidInference |
+| Decoder | 12M (2.5%) | 23MB | No — float16 |
+| JointDecision | 6M (1.3%) | 12MB | No — float16 |
+
+The Encoder is already optimally compressed at 8-bit. Attempted 8→6-bit re-palettization (decompress to fp16 via `decompress_weights()`, then re-palettize with k-means) but file size was unchanged (445.8→445.9MB) due to byte-alignment padding of 6-bit indices, and added run-to-run variance. **Not worth it for the Encoder.**
+
+Decoder and JointDecision are float16 — viable targets for palettization.
+
+### Palettization results
+
+| Config | Decoder Size | Joint Size | Inference (median) | Speed Factor | Quality |
+|---|---|---|---|---|---|
+| Baseline (fp16) | 23MB | 12MB | 345.9 ms | 174.2x RT | Reference |
+| **6-bit Decoder+Joint** | **8.9MB** | **4.8MB** | **310.5 ms** | **193.8x RT** | Identical (punctuation-only diffs) |
+| 4-bit Decoder+Joint | 5.9MB | 3.2MB | 313.8 ms | 191.8x RT | Minor errors ("I I would", "90 page") |
+| 6-bit Encoder+Decoder+Joint | 445.9MB | 4.8MB | 310.4 ms | 194.0x RT | Same as above, more variance |
+
+Raw runs (6-bit Decoder+Joint, 5 each, ms):
+```
+Baseline: 367.5  345.9  345.5  341.9  346.7
+6-bit:    336.6  310.0  310.6  310.5  311.7
+```
+
+**Finding:** 6-bit palettization of Decoder + JointDecision yields **+11% speedup** (174x → 194x RT) with no meaningful quality loss. The smaller LUT weights reduce memory bandwidth in the hot TDT decode loop (~600+ LSTM forward passes per 60s audio). 4-bit pushes too far — introduces token duplication artifacts and is actually slightly slower (ANE may need extra cycles for 4-bit depalettization). Re-palettizing the Encoder from 8→6-bit has no effect because byte-aligned storage negates the compression.
+
+### How to apply
+
+```bash
+pip3 install coremltools huggingface_hub
+python3 model-optimization/palettize.py 6  # creates palettized .mlpackage files
+xcrun coremlcompiler compile palettized/Decoder.mlpackage output/
+xcrun coremlcompiler compile palettized/JointDecision.mlpackage output/
+# Copy .mlmodelc files to ~/Library/Application Support/FluidAudio/Models/parakeet-tdt-0.6b-v3-coreml/
+```
+
 ## Remaining Opportunities
 
 ### Speculative Decoding
@@ -282,7 +325,7 @@ GPU: 620.2  619.7  620.3  619.9  621.8
 - WhisperKit has MLState/MLTensor infrastructure but not used in main inference path
 
 ### Recommendations
-1. **For maximum speed:** Use `--engine parakeet` (default) — 174x RT (v0.10.1), ~36x faster than Whisper, comparable quality
+1. **For maximum speed:** Use `--engine parakeet` (default) — 194x RT with 6-bit palettized decoder (174x stock), ~40x faster than Whisper, comparable quality
 2. **For Whisper speed:** Use `--engine whisper --model large-v3-v20240930_turbo` — 5.5x faster than large-v2
 3. **For balanced speed/quality:** Use `--engine whisper --model distil-large-v3` — 4.6x faster, excellent quality
 4. **For max quality:** Use `--engine whisper --model large-v2` or `large-v3` — 14 tok/s, best multilingual support
