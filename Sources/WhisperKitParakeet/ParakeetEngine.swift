@@ -17,6 +17,9 @@ public final class ParakeetEngine: TranscriptionEngine, @unchecked Sendable {
     /// The Parakeet model version to use (e.g. `.v3` for multilingual).
     public let modelVersion: AsrModelVersion
 
+    /// Enable verbose timing breakdown.
+    public var verbose: Bool = false
+
     private var asrManager: AsrManager?
 
     public init(modelVersion: AsrModelVersion = .v3) {
@@ -29,9 +32,20 @@ public final class ParakeetEngine: TranscriptionEngine, @unchecked Sendable {
         let models = try await AsrModels.downloadAndLoad(version: modelVersion)
 
         modelState = .loading
-        let manager = AsrManager(config: .default)
+        // Disable streaming: use in-memory ChunkProcessor for all file sizes.
+        // The streaming path reads chunks from disk which adds I/O per chunk;
+        // in-memory processing is faster when the full audio fits in RAM.
+        let config = ASRConfig(streamingEnabled: false)
+        let manager = AsrManager(config: config)
         try await manager.initialize(models: models)
         asrManager = manager
+
+        // Pre-warm CoreML models by running a 1-second silent inference.
+        // This JIT-compiles Metal/ANE shaders and warms caches so the
+        // first real transcription doesn't pay the cold-start penalty.
+        let warmupSamples = [Float](repeating: 0, count: 16_000)
+        _ = try? await manager.transcribe(warmupSamples, source: .system)
+
         modelState = .loaded
     }
 
@@ -44,15 +58,31 @@ public final class ParakeetEngine: TranscriptionEngine, @unchecked Sendable {
         let manager = try requireManager()
         let url = URL(fileURLWithPath: audioPath)
         let pipelineStart = CFAbsoluteTimeGetCurrent()
-        let asrResult = try await manager.transcribe(url, source: .system)
 
-        // FluidAudio's streaming path returns duration=0; compute from file as fallback
-        var duration = asrResult.duration
-        if duration <= 0 {
-            let asset = AVURLAsset(url: url)
-            duration = try await CMTimeGetSeconds(asset.load(.duration))
+        let t0 = CFAbsoluteTimeGetCurrent()
+
+        // Convert to 16 kHz mono Float32. Duration is computed from the
+        // sample count, avoiding a separate AVAudioFile probe.
+        let converter = AudioConverter()
+        let samples = try converter.resampleAudioFile(url)
+        let audioDuration = Double(samples.count) / 16000.0
+        let t1 = CFAbsoluteTimeGetCurrent()
+
+        let asrResult = try await manager.transcribe(samples, source: .system)
+        let t2 = CFAbsoluteTimeGetCurrent()
+
+        let result = mapResult(asrResult, audioDuration: audioDuration, pipelineStart: pipelineStart)
+        let t3 = CFAbsoluteTimeGetCurrent()
+
+        if verbose {
+            print(String(format: "  [parakeet] Audio load+resample: %.1f ms", (t1 - t0) * 1000))
+            print(String(format: "  [parakeet] ASR inference:       %.1f ms", (t2 - t1) * 1000))
+            print(String(format: "  [parakeet] Result mapping:      %.1f ms", (t3 - t2) * 1000))
+            print(String(format: "  [parakeet] Total:               %.1f ms", (t3 - t0) * 1000))
+            print(String(format: "  [parakeet] Samples: %d (%.1fs @ 16kHz)", samples.count, audioDuration))
         }
-        return [mapResult(asrResult, audioDuration: duration, pipelineStart: pipelineStart)]
+
+        return [result]
     }
 
     public func transcribe(

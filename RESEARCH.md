@@ -184,13 +184,47 @@ whisperkit-cli transcribe --audio-path audio.m4a --parakeet-model-version v2
 
 | Metric | Homebrew Whisper (large-v3) | Local Parakeet (v3) |
 |--------|---------------------------|---------------------|
-| Inference time | 4.2s | 0.40s |
-| Speed factor | 14.6x RT | 151.9x RT |
+| Inference time | 4.2s | 0.36s |
+| Speed factor | 14.6x RT | 175x RT |
 | Wall time (models cached) | 63.2s | 0.7s |
 | Wall time (cold start) | 63.2s | 12.3s |
 | CPU usage | 72% | 16% |
 
-Parakeet is **10.4x faster inference** and **90x faster wall-clock** (cached) than Whisper large-v3 on the same hardware.
+Parakeet is **~12x faster inference** and **~90x faster wall-clock** (cached) than Whisper large-v3 on the same hardware.
+
+### Parakeet Hot Path Profiling
+
+Instrumented `ParakeetEngine.transcribe(audioPath:)` to identify optimization targets (ted_60.m4a, 60s, 5 runs):
+
+| Phase | Time | % |
+|-------|------|---|
+| Audio load + resample (16kHz mono) | 9ms | 2.5% |
+| **ASR inference (preprocessor + encoder + TDT decoder)** | **356ms** | **96.8%** |
+| Result mapping (ASRResult → TranscriptionResult) | 0.1ms | 0.03% |
+| **Total** | **365ms** | |
+
+The inference phase is entirely inside FluidAudio's CoreML pipeline:
+- **Preprocessor** (mel spectrogram): ~5-8ms — CPU-only, cached MLArray allocation
+- **Encoder** (FastConformer): ~15-20ms — ANE-optimized
+- **TDT Decoder** (joint + LSTM loop): ~35-45ms per chunk — ANE, with blank-token reuse optimization (2-3x speedup on silence frames)
+- **Chunk overhead**: 60s audio = 4 chunks (14.96s each, 2s overlap), sequential processing, token merging at boundaries
+
+### Parakeet Adapter Optimizations Applied
+
+1. **Model pre-warming** (+8% speed factor on first inference): Run 1s silent dummy transcription during `loadModels()` to JIT-compile CoreML Metal/ANE shaders. First-run speed factor improved from 152x → 165x.
+2. **Eliminated AVURLAsset duration probe** (−2.5ms): Compute audio duration from sample count (`samples.count / 16000.0`) instead of async `AVURLAsset.load(.duration)` call.
+3. **Pre-converted audio path**: Use FluidAudio's `AudioConverter` to resample to 16kHz mono before calling `transcribe([Float])`, so FluidAudio's samples path skips its internal converter.
+4. **Disabled streaming I/O**: Set `ASRConfig(streamingEnabled: false)` so the URL path uses in-memory `ChunkProcessor` instead of disk-backed streaming for all file sizes.
+
+**Net improvement: 151.9x → 175x RT** (~15% faster, 5-run median on ted_60.m4a).
+
+### Optimization Paths Investigated But Not Viable
+
+- **URL vs samples path**: Tested passing the file URL directly to FluidAudio vs pre-converting to samples. No meaningful difference (~370ms both ways) — FluidAudio's internal AudioConverter is already efficient.
+- **Streaming vs non-streaming**: Disabling streaming mode (in-memory ChunkProcessor vs disk-backed) showed no improvement — disk I/O is not the bottleneck.
+- **Parallel chunk processing**: Not possible from outside FluidAudio. Chunks share the same `AsrManager` and decoder state, processing is sequential. Even if parallelized, ANE executes a single pipeline, so concurrent CoreML predictions would queue.
+- **Reducing chunk overlap**: The 2.0s overlap is hardcoded in FluidAudio's `ChunkProcessor`. Reducing it would require forking FluidAudio and risks token misalignment at boundaries.
+- **TDT decoder optimizations**: The decoder already implements blank-token reuse (skipping LSTM updates during silence), BLAS-accelerated frame copies, ANE-aligned memory, and zero-copy encoder frame views. No opportunities from the adapter layer.
 
 ### Result Mapping Notes
 
@@ -198,7 +232,7 @@ Parakeet is **10.4x faster inference** and **90x faster wall-clock** (cached) th
 - `ASRResult.tokenTimings` → `[WordTiming]` with per-token start/end/confidence
 - Whisper-specific fields (tokens, tokenLogProbs, compressionRatio, noSpeechProb, temperature) use defaults
 - `decodeOptions` is ignored by Parakeet (no temperature, language selection, etc.)
-- FluidAudio's streaming chunk path returns `duration=0` — worked around by computing duration from `AVURLAsset` as fallback
+- FluidAudio's streaming chunk path returns `duration=0` — worked around by computing duration from sample count
 
 ### Not Yet Implemented
 

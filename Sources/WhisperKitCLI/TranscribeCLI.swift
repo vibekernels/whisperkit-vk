@@ -96,6 +96,7 @@ struct TranscribeCLI: AsyncParsableCommand {
 
         let modelVersion: AsrModelVersion = cliArguments.parakeetModelVersion.lowercased() == "v2" ? .v2 : .v3
         let engine = ParakeetEngine(modelVersion: modelVersion)
+        engine.verbose = cliArguments.verbose
 
         if cliArguments.verbose {
             print("Loading Parakeet models (version: \(cliArguments.parakeetModelVersion))...")
