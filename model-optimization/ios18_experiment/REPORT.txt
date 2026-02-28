@@ -1,0 +1,149 @@
+iOS 18 PALETTIZATION EXPERIMENT REPORT
+======================================
+Date: 2026-02-28
+coremltools: 9.0
+macOS: Darwin 24.6.0 (M1)
+
+OBJECTIVE
+---------
+Test whether iOS 18 palettization features (per-channel scale, vector
+palettization) can be unlocked by modifying existing CoreML model deployment
+targets, WITHOUT re-exporting from PyTorch.
+
+BACKGROUND
+----------
+The original Parakeet models are exported at spec version 8 (iOS 17 / CoreML7
+opset). The coremltools palettize_weights() function checks the MIL program's
+opset version before allowing iOS 18-only features like per-channel scale
+and vector palettization.
+
+KEY FINDING: THE SPEC BUMP TECHNIQUE
+-------------------------------------
+YES, it is possible to unlock iOS 18 palettization by bumping the model's
+specificationVersion from 8 to 9 before palettization. The technique:
+
+    spec = model.get_spec()
+    spec.specificationVersion = 9  # iOS 18
+    model_v9 = ct.models.MLModel(spec, compute_units=..., weights_dir=model.weights_dir)
+    optimized = palettize_weights(model_v9, config_with_per_channel_scale)
+
+This works because:
+1. palettize_weights -> _apply_graph_pass -> _convert_model_spec_to_pymil_prog
+2. The pymil loader sets Function(opset_version=_target(spec_version))
+3. With spec version 9, the opset is iOS18
+4. is_current_opset_version_compatible_with(iOS18) returns True
+5. constexpr_blockwise_shift_scale op (per-channel scale) is allowed
+
+RESULTS BY MODEL
+----------------
+
+Encoder:
+  - FAILED. Already contains 294 constexpr_lut_to_dense ops (6-bit LUT from
+    source NVIDIA export). When loaded under iOS 18 opset, the op signature
+    is incompatible (iOS 17 LUT ops have a 'shape' parameter that iOS 18
+    definition doesn't accept).
+  - Cannot further compress without re-exporting from PyTorch.
+  - Original size: 445.8 MB (already 6-bit palettized at export time)
+
+Decoder:
+  - SUCCESS. 4-bit palettized with per-channel-scale.
+  - mlpackage: 23.6 MB -> 6.0 MB (25.5%)
+  - Compiled:  8.5 MB -> 5.8 MB (68%)
+  - Time: 1.3s
+
+JointDecision:
+  - SUCCESS. 4-bit palettized with per-channel-scale.
+  - mlpackage: 12.7 MB -> 3.3 MB (25.8%)
+  - Compiled:  4.6 MB -> 3.1 MB (67%)
+  - Time: 0.7s
+
+Vector Palettization (cluster_dim=2):
+  - FAILED. The palettization pass succeeds, but the subsequent MIL
+    canonicalization pass (canonicalize_quantized_lut_pattern) fails with:
+    "When lut's last dim (VECTOR_SIZE) > 1, the parameter 'vector_axis'
+    need to be provided."
+  - This appears to be a bug/limitation in coremltools 9.0's optimization
+    pipeline when vector palettization is applied post-hoc.
+
+BENCHMARK: 6-BIT BASELINE vs 4-BIT iOS 18 (per-channel-scale)
+--------------------------------------------------------------
+Audio: ted_60.m4a (60 seconds)
+Note: Only Decoder and JointDecision changed. Encoder unchanged (dominant model).
+
+6-BIT BASELINE (5 runs):
+  Run 1: 348.2 ms total, 336.3 ms inference, 178.9x RT
+  Run 2: 324.0 ms total, 314.7 ms inference, 191.3x RT
+  Run 3: 321.4 ms total, 312.2 ms inference, 192.8x RT
+  Run 4: 322.1 ms total, 313.1 ms inference, 192.3x RT
+  Run 5: 322.2 ms total, 313.1 ms inference, 192.3x RT
+  Avg (runs 2-5): 322.4 ms, 313.3 ms inference, 192.2x RT
+
+4-BIT iOS 18 PER-CHANNEL-SCALE (5 runs):
+  Run 1: 495.1 ms total, 486.1 ms inference, 123.9x RT
+  Run 2: 448.4 ms total, 438.7 ms inference, 137.3x RT
+  Run 3: 449.2 ms total, 440.0 ms inference, 136.9x RT
+  Run 4: 451.9 ms total, 442.6 ms inference, 136.1x RT
+  Run 5: 457.0 ms total, 447.8 ms inference, 134.5x RT
+  Avg (runs 2-5): 451.6 ms, 442.3 ms inference, 136.2x RT
+
+PERFORMANCE DELTA: +129.2 ms (+40.1% slower), 136.2x vs 192.2x RT
+
+TRANSCRIPT QUALITY
+------------------
+Both 6-bit and 4-bit produce virtually identical transcripts. The only
+differences are minor punctuation variations (commas removed in a few places
+in the 4-bit output), which is likely due to the JointDecision model's
+slightly different weight values affecting punctuation confidence thresholds.
+
+6-bit snippet: "So in college, I was a government major..."
+4-bit snippet: "So in college I was a government major..."
+
+Content accuracy is identical. No word-level errors in either version.
+
+CONCLUSIONS
+-----------
+1. THE SPEC BUMP TRICK WORKS for models that don't already contain
+   constexpr_lut_to_dense ops. Bumping specificationVersion 8->9 unlocks
+   iOS 18 palettization features without re-exporting from PyTorch.
+
+2. THE ENCODER IS THE BOTTLENECK. At 425 MB compiled, it dominates the
+   pipeline. Since it's already 6-bit palettized from the NVIDIA export,
+   we cannot re-palettize it by spec bumping (incompatible op signature).
+   Re-exporting the Encoder from PyTorch with an iOS 18 target would be
+   needed to unlock further compression.
+
+3. 4-BIT PER-CHANNEL-SCALE IS SLOWER. Despite smaller model size
+   (5.8+3.1=8.9 MB vs 8.5+4.6=13.1 MB), inference is 40% slower.
+   The iOS 18 constexpr_blockwise_shift_scale op adds overhead for
+   dequantization, and the ANE may not handle the new op path as
+   efficiently. The Decoder and JointDecision are called many times
+   during greedy decoding, so per-call overhead compounds.
+
+4. NOT RECOMMENDED for the current pipeline. The 6-bit baseline at
+   192x RT is already excellent. The 4-bit iOS 18 version trades
+   4.2 MB model savings for a 40% speed regression -- a poor tradeoff
+   when the Encoder (425 MB) dominates total model size anyway.
+
+5. VECTOR PALETTIZATION needs coremltools fixes or must be applied
+   during initial conversion from PyTorch, not post-hoc.
+
+RECOMMENDATION
+--------------
+Keep the 6-bit models. If further compression is desired in the future:
+- Re-export the Encoder from PyTorch targeting ct.target.iOS18
+- Apply 4-bit or 6-bit palettization with per-channel-scale at export time
+- The spec bump technique documented here can be reused for Decoder/Joint
+
+FILES
+-----
+ios18_palettize.py          - Experiment script
+experiment_log.txt          - Detailed palettization log
+benchmark_baseline.txt      - 6-bit baseline benchmark output (5 runs)
+benchmark_4bit_ios18.txt    - 4-bit iOS 18 benchmark output (5 runs)
+Decoder.mlpackage/          - 4-bit per-channel-scale Decoder (mlpackage)
+Decoder.mlmodelc/           - 4-bit per-channel-scale Decoder (compiled)
+JointDecision.mlpackage/    - 4-bit per-channel-scale JointDecision (mlpackage)
+JointDecision.mlmodelc/     - 4-bit per-channel-scale JointDecision (compiled)
+Preprocessor.mlpackage/     - Copied unchanged from original
+MelEncoder.mlpackage/       - Copied unchanged from original
+REPORT.txt                  - This file

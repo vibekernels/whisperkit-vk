@@ -1,0 +1,123 @@
+======================================================================
+iOS 18 PALETTIZATION EXPERIMENT
+coremltools version: 9.0
+======================================================================
+
+── STEP 1: Current Model Spec Versions ──
+  Encoder: specificationVersion=8
+  Decoder: specificationVersion=8
+  JointDecision: specificationVersion=8
+  Preprocessor: specificationVersion=8
+  MelEncoder: specificationVersion=8
+
+── STEP 2: Try per-channel-scale palettization WITHOUT spec bump ──
+  RESULT: FAILED as expected
+  Error: Palettization with per-channel-scale is only supported since iOS18. Please set minimum_deployment_target accordingly.
+
+── STEP 3: Bump spec version 8→9 (iOS 18), then palettize ──
+
+  Processing Encoder...
+    Bumped specificationVersion: 8 → 9
+    FAILED: Unknown input 'shape' for op 'constexpr_lut_to_dense'
+    Traceback:
+Traceback (most recent call last):
+  File "/Users/m1/whisperkit-vk/model-optimization/ios18_experiment/ios18_palettize.py", line 109, in <module>
+    optimized = palettize_weights(model_v9, config)
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/optimize/coreml/_post_training_quantization.py", line 49, in decorator
+    return func(*args, **kwargs)
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/optimize/coreml/_post_training_quantization.py", line 267, in palettize_weights
+    return _model_utils._apply_graph_pass(mlmodel, weight_palettizer)
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/models/utils.py", line 1359, in _apply_graph_pass
+    prog = _convert_model_spec_to_pymil_prog(mlmodel, specification_version, pymil_load_func)
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/models/utils.py", line 1335, in _convert_model_spec_to_pymil_prog
+    prog = pymil_load_func(
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/frontend/milproto/load.py", line 618, in load
+    return load_mil_proto(model_spec.mlProgram, specification_version, file_weights_dir)
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/frontend/milproto/load.py", line 592, in load_mil_proto
+    func_name, _load_function(context, func_spec, specification_version)
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/frontend/milproto/load.py", line 557, in _load_function
+    _load_block(context, func_spec.block_specializations[opset])
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/frontend/milproto/load.py", line 514, in _load_block
+    _load_operation(context, op_spec)
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/frontend/milproto/load.py", line 360, in _load_operation
+    _load_const_op(context, op_spec)
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/frontend/milproto/load.py", line 327, in _load_const_op
+    output_var = getattr(mb, op_spec.type)(**inputs)
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/mil/ops/registry.py", line 183, in add_op
+    return cls._add_op(op_cls_to_add, **kwargs)
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/mil/builder.py", line 217, in _add_op
+    new_op = op_cls(**kwargs)
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/mil/operation.py", line 181, in __init__
+    self._check_expected_inputs(kwargs)
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/mil/operation.py", line 220, in _check_expected_inputs
+    raise ValueError(
+ValueError: Unknown input 'shape' for op 'constexpr_lut_to_dense'
+
+
+  Processing Decoder...
+    Bumped specificationVersion: 8 → 9
+    Palettization: SUCCESS in 1.3s
+    Output specificationVersion: 9
+    Size: 23.6MB → 6.0MB (25.5%)
+
+  Processing JointDecision...
+    Bumped specificationVersion: 8 → 9
+    Palettization: SUCCESS in 0.7s
+    Output specificationVersion: 9
+    Size: 12.7MB → 3.3MB (25.8%)
+
+── STEP 4: Try vector palettization (cluster_dim=2) with iOS 18 spec bump ──
+  Vector palettization FAILED: When lut's last dim (VECTOR_SIZE) > 1, the parameter 'vector_axis' need to be provided.
+  Traceback:
+Traceback (most recent call last):
+  File "/Users/m1/whisperkit-vk/model-optimization/ios18_experiment/ios18_palettize.py", line 159, in <module>
+    optimized = palettize_weights(model_v9, config)
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/optimize/coreml/_post_training_quantization.py", line 49, in decorator
+    return func(*args, **kwargs)
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/optimize/coreml/_post_training_quantization.py", line 267, in palettize_weights
+    return _model_utils._apply_graph_pass(mlmodel, weight_palettizer)
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/models/utils.py", line 1376, in _apply_graph_pass
+    compressed_mlmodel = _mil_convert(
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/converter.py", line 186, in mil_convert
+    return _mil_convert(
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/converter.py", line 218, in _mil_convert
+    proto, mil_program = mil_convert_to_proto(
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/converter.py", line 297, in mil_convert_to_proto
+    PassPipelineManager.apply_pipeline(prog, main_pipeline)
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/mil/passes/pass_pipeline.py", line 501, in apply_pipeline
+    raise e  # re-raise exception
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/mil/passes/pass_pipeline.py", line 496, in apply_pipeline
+    graph_pass(prog)
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/mil/passes/graph_pass.py", line 56, in __call__
+    self.apply(prog)
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/mil/passes/defs/optimize_quantization.py", line 1169, in apply
+    apply_block(f)
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/mil/passes/helper.py", line 64, in wrapper
+    return _func(*args)
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/mil/passes/defs/optimize_quantization.py", line 1166, in apply_block
+    self._reorder_quant_lut(block, op)
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/mil/passes/defs/optimize_quantization.py", line 1237, in _reorder_quant_lut
+    new_op2 = mb.constexpr_lut_to_dense(**new_op2_args)
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/mil/ops/registry.py", line 183, in add_op
+    return cls._add_op(op_cls_to_add, **kwargs)
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/mil/builder.py", line 237, in _add_op
+    new_op.type_value_inference()
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/mil/operation.py", line 262, in type_value_inference
+    output_types = self.type_inference()
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/mil/ops/defs/iOS18/compression.py", line 363, in type_inference
+    self._validate_inputs()
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/mil/ops/defs/iOS18/compression.py", line 358, in _validate_inputs
+    self._validate_lut_inputs(
+  File "/Users/m1/Library/Python/3.9/lib/python/site-packages/coremltools/converters/mil/mil/ops/defs/iOS18/compression.py", line 352, in _validate_lut_inputs
+    raise ValueError(
+ValueError: When lut's last dim (VECTOR_SIZE) > 1, the parameter 'vector_axis' need to be provided.
+
+
+── Copying non-palettized models ──
+  Copied Preprocessor
+  Copied MelEncoder
+
+── SUMMARY ──
+  Encoder: FAILED - Unknown input 'shape' for op 'constexpr_lut_to_dense'
+  Decoder: 23.6MB → 6.0MB in 1.3s
+  JointDecision: 12.7MB → 3.3MB in 0.7s

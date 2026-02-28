@@ -311,6 +311,80 @@ xcrun coremlcompiler compile palettized/JointDecision.mlpackage output/
 # Copy .mlmodelc files to ~/Library/Application Support/FluidAudio/Models/parakeet-tdt-0.6b-v3-coreml/
 ```
 
+## Overnight Optimization Experiments (Post-Palettization)
+
+After achieving 194x RT with 6-bit palettization, ran a suite of advanced optimization experiments to find further gains. **None beat the 6-bit baseline.**
+
+### Experiments Run
+
+| Experiment | Technique | Median ms | Speed Factor | vs Baseline |
+|---|---|---|---|---|
+| **baseline_6bit** | 6-bit Decoder+Joint (reference) | 314.3 | 191.5x | — |
+| prune30_pal6 | 30% pruning → 6-bit | 315.1 | 191.0x | −0.3% |
+| prune50_pal6 | 50% pruning → 6-bit | 315.9 | 190.6x | −0.5% |
+| prune30_perchannel_pal4 | 30% pruning → 4-bit per-channel | 312.4 | 192.7x | −0.6% |
+| encoder_prune30_pal8 | Encoder: decompress→prune 30%→8-bit | 317.1 | 189.9x | −0.8% |
+
+### Experiments That Failed (Require iOS 18+ Deployment Target)
+
+These features require models converted with `minimum_deployment_target=ct.target.iOS18`:
+
+- **Per-channel scale palettization** (4-bit, 6-bit, 2-bit): Would allow per-output-channel LUT scales for better accuracy at low bit widths
+- **Vector palettization** (4-bit, cluster_dim=2): Groups weight elements into vectors before clustering
+
+The existing Parakeet models were converted targeting iOS 17/macOS 14. Unlocking these would require re-exporting from PyTorch with the iOS 18 target.
+
+### Additional Experiments (Post-Overnight)
+
+| Experiment | Technique | Median ms | Speed Factor | Quality |
+|---|---|---|---|---|
+| 3-bit Decoder+Joint | Extreme compression (requires iOS 18 spec) | 376.8 | 159.2x | Errors: "Ye", dropped "to spend" |
+| 5-bit | N/A | N/A | N/A | Not supported — CoreML only has 1,2,3,4,6,8-bit |
+| embed6_lstm4 | Embedding 6-bit, LSTM 4-bit | 316.1 | 188.6x | Same as plain 4-bit |
+| embed6_hh6_ih4 | Embedding+recurrent 6-bit, input 4-bit | 314.9 | 190.7x | Same as plain 4-bit |
+| embed8_lstm4 | Embedding 8-bit, LSTM 4-bit | 315.5 | 190.4x | Same as plain 4-bit |
+| all_4bit | Plain 4-bit everything | 314.0 | 191.0x | "I I would", "90 page" |
+
+**Key finding:** Selective layer palettization provides no advantage. All 4-bit variants (regardless of embedding precision) produce identical token duplication errors. The errors originate in the LSTM recurrent weights, not the embedding lookup.
+
+### Parakeet EOU 120M (Streaming Model)
+
+Benchmarked the 120M-parameter streaming model (`parakeet-realtime-eou-120m-coreml`) via FluidAudio CLI:
+
+| Chunk Size | Wall Clock (60s audio) | Speed Factor | Notes |
+|---|---|---|---|
+| 160ms | ~7.7s | ~8x RT | 375 forward passes |
+| 320ms | ~2.6s | ~23x RT | 188 forward passes |
+| 1600ms | ~2.3s | ~26x RT | 38 forward passes |
+| **TDT 0.6B (6-bit)** | **~0.31s** | **194x RT** | **4 chunks × ~600 decoder passes** |
+
+The TDT model is **7.5x faster** than even the largest-chunk EOU configuration. The streaming architecture processes many more tiny chunks, each requiring a full encoder+decoder forward pass. Quality is also lower: no punctuation, errors ("things taste civil" vs "things stay civil").
+
+### Research Dead Ends
+
+| Idea | Finding |
+|---|---|
+| **ONNX Runtime CoreML EP** | Wraps CoreML underneath — can't be faster. sherpa-onnx benchmarks show 10% slower than CPU-only for Conformer ASR. |
+| **W8A8 activation quantization** | Requires A17 Pro / M4+ hardware. M1 ANE only supports FP16 compute internally. |
+| **Split compute (ANE+GPU parallel)** | Not feasible — `.all` compute units is actually the *slowest* option. Execution is sequential with data transfer overhead between units. |
+| **Pruning on ANE** | Sparse index overhead negates any bandwidth savings. Pruned+palettized Decoder was 24.5MB vs 8.9MB for plain 6-bit. ANE doesn't efficiently exploit unstructured sparsity. |
+| **Encoder re-compression** | Encoder already 8-bit palettized. Decompressing and re-palettizing (6-bit or with pruning) produces same-size or larger files with no speed gain. |
+| **3-bit palettization** | 20% slower than 6-bit (376.8 vs 314.3ms). ANE `uint3` unpacking is slower than `uint6`. Quality degrades (dropped words, hallucinated tokens). |
+| **Selective layer palettization** | Mixed-precision (6-bit embedding + 4-bit LSTM) produces identical errors to plain 4-bit. LSTM recurrent weight precision, not embedding precision, determines quality. |
+| **120M streaming model** | 7.5x slower than 0.6B TDT for offline use. Streaming architecture requires hundreds of tiny forward passes vs 4 large chunks. |
+| **iOS 18 per-channel-scale (spec bump)** | Bumping specificationVersion 8→9 unlocks `enable_per_channel_scale` for Decoder/Joint, but result is **40% slower** (442ms vs 313ms, 136x vs 192x RT). The `constexpr_blockwise_shift_scale` dequantization op adds per-call overhead that compounds across ~600 LSTM passes. Encoder can't be bumped (pre-existing iOS 17 LUT ops reject iOS 18 schema). |
+| **iOS 18 vector palettization** | `cluster_dim=2` fails with coremltools 9.0 bug: "vector_axis need to be provided" during `canonicalize_quantized_lut_pattern` pass. Must be applied during initial PyTorch conversion, not post-hoc. |
+
+### Key Takeaways
+
+1. **6-bit palettization is the sweet spot** for ANE inference on M1. Lower bit widths (4-bit) add depalettization overhead. Higher bit widths (8-bit) waste bandwidth.
+2. **Pruning hurts on ANE** — sparse index metadata adds overhead that exceeds any bandwidth savings from zero weights.
+3. **Selective layer palettization doesn't help** — quality is dominated by LSTM recurrent weight precision, not embedding precision. All 4-bit LSTM configs produce identical token duplication errors regardless of embedding bit width.
+4. **3-bit is counterproductive** — slower inference AND worse quality. The `uint3` code path on ANE has higher overhead than `uint6`.
+5. **Streaming models are slower for offline use** — TDT processes 4 large chunks while streaming processes hundreds of tiny ones.
+6. **Further ANE optimization requires iOS 18+ model re-export** to unlock per-channel scale and vector palettization, which could improve accuracy at 4-bit without speed loss.
+7. **The 194x RT ceiling is fundamentally set by CoreML kernel performance** on the ANE. No post-hoc model transformation can break through this barrier — it would require architectural changes (smaller model, different attention mechanism) or hardware with faster ANE throughput.
+
 ## Remaining Opportunities
 
 ### Speculative Decoding

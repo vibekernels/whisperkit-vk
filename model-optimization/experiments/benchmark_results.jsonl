@@ -1,0 +1,11 @@
+{"experiment":"baseline_6bit","median_ms":314.3,"median_speed":191.5,"runs":[338.7,313.7,314.3,311.4,314.5]}
+{"experiment":"prune30_pal6","median_ms":315.1,"median_speed":191.0,"runs":[315.4,315.1,312.9,312.9,333.8]}
+{"experiment":"prune50_pal6","median_ms":315.9,"median_speed":190.6,"runs":[315.2,315.9,313.8,316.1,317.2]}
+{"experiment":"perchannel_pal4","median_ms":310.1,"median_speed":194.1,"runs":[309.7,309.2,332.1,310.1,310.6]}
+{"experiment":"perchannel_pal6","median_ms":313.9,"median_speed":191.9,"runs":[316.1,314.7,313.8,313.9,311.3]}
+{"experiment":"vector_pal4_dim2","median_ms":313.9,"median_speed":191.8,"runs":[314.3,313.9,314.3,310.7,313.5]}
+{"experiment":"prune30_perchannel_pal4","median_ms":312.4,"median_speed":192.7,"runs":[313.7,310.0,312.0,312.4,322.2]}
+{"experiment":"perchannel_pal2","median_ms":315.8,"median_speed":190.7,"runs":[316.5,325.1,315.8,314.0,312.6]}
+{"experiment":"encoder_4bit_perchannel","median_ms":313.9,"median_speed":191.8,"runs":[312.9,315.1,310.8,313.9,314.5]}
+{"experiment":"encoder_prune30_pal8","median_ms":317.1,"median_speed":189.9,"runs":[317.1,317.7,314.1,318.6,315.7]}
+{"experiment":"decoder_joint_3bit","median_ms":376.8,"median_speed":159.2,"runs":[374.9,378.4,377.1,376.8,376.6]}
