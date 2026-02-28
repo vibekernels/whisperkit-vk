@@ -10,6 +10,9 @@ struct TranscribeCLIArguments: ParsableArguments {
     @Option(help: "Parakeet model version: \"v2\" (English-only) or \"v3\" (multilingual). Default: \"v3\"")
     var parakeetModelVersion: String = "v3"
 
+    @Option(help: "Compute units for Parakeet models with {all,cpuOnly,cpuAndGPU,cpuAndNeuralEngine}")
+    var parakeetComputeUnits: ComputeUnits = .cpuAndNeuralEngine
+
     @Option(help: "Paths to audio files")
     var audioPath = [String]()
 

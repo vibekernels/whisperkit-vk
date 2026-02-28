@@ -241,6 +241,33 @@ The inference phase is entirely inside FluidAudio's CoreML pipeline:
 - Language selection for Parakeet (model version determines it)
 - Translate task for Parakeet (not supported by the model)
 
+## FluidAudio Internal Optimization Experiment (v0.12.1)
+
+Forked FluidAudio v0.12.1 and applied 5 internal optimizations (single-source decoder reset, cached projection layout, reusable chunk buffers, reusable DP table, fused audio padding). Result: **+0.7%** improvement (426.1 → 422.7ms median). Reverted to upstream v0.10.1 because:
+
+1. v0.12.1 regressed from 175x → 141x RT vs v0.10.1 (new vocabulary boosting, CTC keyword spotting code paths)
+2. The 0.7% fork optimization doesn't offset the 24% version regression
+3. 96.8% of time is in CoreML kernels — untouchable from Swift code
+
+**Decision:** Pinned `Package.swift` to `FluidAudio exact: "0.10.1"` for maximum speed (174x RT).
+
+## Parakeet Compute Unit Comparison (10 GPU core Mac, FluidAudio v0.10.1)
+
+Added `--parakeet-compute-units` flag to test ANE vs GPU for Parakeet TDT.
+
+| Compute Units | Inference (median) | Speed Factor | Notes |
+|---|---|---|---|
+| `cpuAndNeuralEngine` (default) | **345.9 ms** | **174.2x RT** | ANE handles encoder + decoder + joint |
+| `cpuAndGPU` | 620.2 ms | 96.9x RT | 79% slower than ANE |
+
+Raw runs (5 each, ms):
+```
+ANE: 367.5  345.9  345.5  341.9  346.7
+GPU: 620.2  619.7  620.3  619.9  621.8
+```
+
+**Finding:** ANE is **79% faster** than GPU for Parakeet on 10-core Macs. This matches the Whisper text decoder result (ANE +85% on 10-core). Transcription output is near-identical across compute units. GPU is not a path to faster Parakeet inference on this hardware.
+
 ## Remaining Opportunities
 
 ### Speculative Decoding
@@ -255,7 +282,7 @@ The inference phase is entirely inside FluidAudio's CoreML pipeline:
 - WhisperKit has MLState/MLTensor infrastructure but not used in main inference path
 
 ### Recommendations
-1. **For maximum speed:** Use `--engine parakeet` (default) — 151.9x RT, ~10x faster than Whisper, comparable quality
+1. **For maximum speed:** Use `--engine parakeet` (default) — 174x RT (v0.10.1), ~36x faster than Whisper, comparable quality
 2. **For Whisper speed:** Use `--engine whisper --model large-v3-v20240930_turbo` — 5.5x faster than large-v2
 3. **For balanced speed/quality:** Use `--engine whisper --model distil-large-v3` — 4.6x faster, excellent quality
 4. **For max quality:** Use `--engine whisper --model large-v2` or `large-v3` — 14 tok/s, best multilingual support

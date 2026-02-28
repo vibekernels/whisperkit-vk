@@ -2,6 +2,7 @@
 //  Copyright © 2024 Argmax, Inc. All rights reserved.
 
 import AVFoundation
+import CoreML
 import Foundation
 import WhisperKit
 
@@ -27,9 +28,10 @@ public final class ParakeetEngine: TranscriptionEngine, @unchecked Sendable {
     }
 
     /// Downloads (if needed) and loads the Parakeet TDT models.
-    public func loadModels() async throws {
+    /// - Parameter configuration: Optional `MLModelConfiguration` to override default compute units.
+    public func loadModels(configuration: MLModelConfiguration? = nil) async throws {
         modelState = .downloading
-        let models = try await AsrModels.downloadAndLoad(version: modelVersion)
+        let models = try await AsrModels.downloadAndLoad(configuration: configuration, version: modelVersion)
 
         modelState = .loading
         // Disable streaming: use in-memory ChunkProcessor for all file sizes.

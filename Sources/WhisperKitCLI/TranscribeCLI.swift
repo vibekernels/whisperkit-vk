@@ -98,10 +98,12 @@ struct TranscribeCLI: AsyncParsableCommand {
         let engine = ParakeetEngine(modelVersion: modelVersion)
         engine.verbose = cliArguments.verbose
 
+        let mlConfig = MLModelConfiguration()
+        mlConfig.computeUnits = cliArguments.parakeetComputeUnits.asMLComputeUnits
         if cliArguments.verbose {
-            print("Loading Parakeet models (version: \(cliArguments.parakeetModelVersion))...")
+            print("Loading Parakeet models (version: \(cliArguments.parakeetModelVersion), compute: \(cliArguments.parakeetComputeUnits.rawValue))...")
         }
-        try await engine.loadModels()
+        try await engine.loadModels(configuration: mlConfig)
         if cliArguments.verbose {
             print("Models loaded.")
         }
