@@ -34,7 +34,7 @@ jobs:
       - name: Build and Test
         run: |
           set -o pipefail
-          xcodebuild clean build-for-testing -scheme whisperkit-Package -destination 'generic/platform=macOS' | xcpretty
+          xcodebuild clean build-for-testing -scheme whisperkit-Package -destination 'platform=macOS,arch=arm64' | xcpretty
           xcodebuild test -testPlan UnitTestsPlan -scheme whisperkit-Package -destination 'platform=macOS,arch=arm64'
       - name: Upload Test Results
         if: failure()
