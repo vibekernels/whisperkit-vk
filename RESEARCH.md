@@ -151,6 +151,62 @@ This is a model architecture + export change, not a code optimization. WhisperKi
 
 **Conclusion:** The batched decoding speed gap is a model format limitation. No code changes in this repo can address it.
 
+## Unified Engine Integration (Parakeet + Whisper)
+
+Integrated FluidAudio's Parakeet TDT as a first-class ASR backend alongside Whisper via a new `TranscriptionEngine` protocol abstraction. Parakeet is the default engine.
+
+### Architecture
+
+```
+TranscriptionEngine (protocol)  ← Sources/WhisperKit/Core/TranscriptionEngine.swift
+├── WhisperEngine                ← Sources/WhisperKit/Core/WhisperEngine.swift
+└── ParakeetEngine               ← Sources/WhisperKitParakeet/ParakeetEngine.swift
+```
+
+- `WhisperEngine`: thin adapter forwarding to the existing `WhisperKit` class
+- `ParakeetEngine`: wraps FluidAudio `AsrManager`, maps `ASRResult` → `TranscriptionResult`
+- `WhisperKitParakeet` is a separate SPM target (depends on WhisperKit + FluidAudio) to keep FluidAudio out of the core library
+
+### CLI Usage
+
+```bash
+# Parakeet (default)
+whisperkit-cli transcribe --audio-path audio.m4a
+
+# Whisper
+whisperkit-cli transcribe --audio-path audio.m4a --engine whisper --model large-v2
+
+# Parakeet English-only model
+whisperkit-cli transcribe --audio-path audio.m4a --parakeet-model-version v2
+```
+
+### Integrated Benchmark (10 GPU core Mac, ted_60.m4a 60s)
+
+| Metric | Homebrew Whisper (large-v3) | Local Parakeet (v3) |
+|--------|---------------------------|---------------------|
+| Inference time | 4.2s | 0.40s |
+| Speed factor | 14.6x RT | 151.9x RT |
+| Wall time (models cached) | 63.2s | 0.7s |
+| Wall time (cold start) | 63.2s | 12.3s |
+| CPU usage | 72% | 16% |
+
+Parakeet is **10.4x faster inference** and **90x faster wall-clock** (cached) than Whisper large-v3 on the same hardware.
+
+### Result Mapping Notes
+
+- Parakeet is non-autoregressive — produces a single segment for the full audio
+- `ASRResult.tokenTimings` → `[WordTiming]` with per-token start/end/confidence
+- Whisper-specific fields (tokens, tokenLogProbs, compressionRatio, noSpeechProb, temperature) use defaults
+- `decodeOptions` is ignored by Parakeet (no temperature, language selection, etc.)
+- FluidAudio's streaming chunk path returns `duration=0` — worked around by computing duration from `AVURLAsset` as fallback
+
+### Not Yet Implemented
+
+- Streaming support for Parakeet (`StreamingAsrManager`)
+- Server CLI (`OpenAIHandler`) engine support
+- Language selection for Parakeet (model version determines it)
+- Translate task for Parakeet (not supported by the model)
+
 ## Remaining Opportunities
 
 ### Speculative Decoding
@@ -165,9 +221,9 @@ This is a model architecture + export change, not a code optimization. WhisperKi
 - WhisperKit has MLState/MLTensor infrastructure but not used in main inference path
 
 ### Recommendations
-1. **For maximum speed:** FluidAudio's Parakeet TDT is ~32-38x faster than Whisper with comparable quality (non-autoregressive architecture)
-2. **For Whisper speed:** Use `large-v3-v20240930_turbo` — 5.5x faster than large-v2 with near-identical English quality
-3. **For balanced speed/quality:** Use `distil-large-v3` — 4.6x faster, excellent quality
-4. **For max quality:** Use `large-v2` or `large-v3` — 14 tok/s, best multilingual support
+1. **For maximum speed:** Use `--engine parakeet` (default) — 151.9x RT, ~10x faster than Whisper, comparable quality
+2. **For Whisper speed:** Use `--engine whisper --model large-v3-v20240930_turbo` — 5.5x faster than large-v2
+3. **For balanced speed/quality:** Use `--engine whisper --model distil-large-v3` — 4.6x faster, excellent quality
+4. **For max quality:** Use `--engine whisper --model large-v2` or `large-v3` — 14 tok/s, best multilingual support
 5. **Avoid quantized models** on GPU-rich Macs — CoreML's native float16 is faster than int8 dequantization
 6. **Fix auto-selection for <14 GPU core Macs** — the `else if large` branch forces cpuAndGPU which is ~48% slower than ANE on these machines

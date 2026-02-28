@@ -5,6 +5,7 @@ import ArgumentParser
 import CoreML
 import Foundation
 import WhisperKit
+import WhisperKitParakeet
 
 struct TranscribeCLI: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -16,7 +17,15 @@ struct TranscribeCLI: AsyncParsableCommand {
     var cliArguments: TranscribeCLIArguments
 
     mutating func validate() throws {
-        if let language = cliArguments.language {
+        let engineName = cliArguments.engine.lowercased()
+        guard engineName == "parakeet" || engineName == "whisper" else {
+            throw ValidationError("Invalid engine \"\(cliArguments.engine)\". Use \"parakeet\" or \"whisper\".")
+        }
+
+        let isWhisper = engineName == "whisper"
+
+        // Language validation only applies to Whisper
+        if isWhisper, let language = cliArguments.language {
             if !Constants.languages.values.contains(language) {
                 throw ValidationError("Invalid language code \"\(language)\". Supported languages: \(Constants.languages.values)")
             }
@@ -37,8 +46,14 @@ struct TranscribeCLI: AsyncParsableCommand {
             cliArguments.audioPath = audioFiles.map { audioFolder + "/" + $0 }
         }
 
-        if ChunkingStrategy(rawValue: cliArguments.chunkingStrategy) == nil {
+        // Chunking validation only applies to Whisper
+        if isWhisper, ChunkingStrategy(rawValue: cliArguments.chunkingStrategy) == nil {
             throw ValidationError("Wrong chunking strategy \"\(cliArguments.chunkingStrategy)\", valid strategies: \(ChunkingStrategy.allCases.map { $0.rawValue })")
+        }
+
+        // Streaming is Whisper-only for now
+        if !isWhisper && (cliArguments.stream || cliArguments.streamSimulated) {
+            throw ValidationError("Streaming is only supported with --engine whisper")
         }
     }
 
@@ -47,12 +62,71 @@ struct TranscribeCLI: AsyncParsableCommand {
             try await transcribeStream()
         } else if cliArguments.streamSimulated {
             try await transcribeStreamSimulated()
+        } else if cliArguments.engine.lowercased() == "parakeet" {
+            if #available(macOS 14.0, iOS 17.0, *) {
+                try await transcribeParakeet()
+            } else {
+                throw ValidationError("Parakeet engine requires macOS 14+ / iOS 17+. Use --engine whisper on older OS versions.")
+            }
         } else {
-            try await transcribe()
+            try await transcribeWhisper()
         }
     }
 
-    private func transcribe() async throws {
+    @available(macOS 14.0, iOS 17.0, *)
+    private func transcribeParakeet() async throws {
+        if cliArguments.verbose {
+            print("\nStarting Parakeet transcription...")
+        }
+
+        let resolvedAudioPaths = cliArguments.audioPath.map { FileManager.resolveAbsolutePath($0) }
+        if cliArguments.verbose {
+            print("\nResolved audio paths:")
+            resolvedAudioPaths.forEach { print("  - \($0)") }
+        }
+
+        for resolvedAudioPath in resolvedAudioPaths {
+            guard FileManager.default.fileExists(atPath: resolvedAudioPath) else {
+                if cliArguments.verbose {
+                    print("\nError: File not found at path: \(resolvedAudioPath)")
+                }
+                throw CocoaError.error(.fileNoSuchFile)
+            }
+        }
+
+        let modelVersion: AsrModelVersion = cliArguments.parakeetModelVersion.lowercased() == "v2" ? .v2 : .v3
+        let engine = ParakeetEngine(modelVersion: modelVersion)
+
+        if cliArguments.verbose {
+            print("Loading Parakeet models (version: \(cliArguments.parakeetModelVersion))...")
+        }
+        try await engine.loadModels()
+        if cliArguments.verbose {
+            print("Models loaded.")
+        }
+
+        for resolvedAudioPath in resolvedAudioPaths {
+            do {
+                let results = try await engine.transcribe(audioPath: resolvedAudioPath, decodeOptions: nil)
+                let mergedResult = TranscriptionUtilities.mergeTranscriptionResults(results)
+
+                if cliArguments.verbose {
+                    let timings = mergedResult.timings
+                    print("Transcription Performance:")
+                    print(String(format: "  - Processing time: %.2f seconds", timings.fullPipeline))
+                    print(String(format: "  - Audio duration: %.2f seconds", timings.inputAudioSeconds))
+                    print(String(format: "  - Real-time factor: %.4f", timings.realTimeFactor))
+                    print(String(format: "  - Speed factor: %.1fx", timings.speedFactor))
+                }
+
+                processTranscriptionResult(audioPath: resolvedAudioPath, transcribeResult: mergedResult)
+            } catch {
+                print("Error when transcribing \(resolvedAudioPath): \(error)")
+            }
+        }
+    }
+
+    private func transcribeWhisper() async throws {
         if cliArguments.verbose {
             print("\nStarting transcription process...")
         }

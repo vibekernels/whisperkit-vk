@@ -4,6 +4,12 @@
 import ArgumentParser
 
 struct TranscribeCLIArguments: ParsableArguments {
+    @Option(help: "ASR engine to use: \"parakeet\" (default, fast) or \"whisper\" (full Whisper pipeline)")
+    var engine: String = "parakeet"
+
+    @Option(help: "Parakeet model version: \"v2\" (English-only) or \"v3\" (multilingual). Default: \"v3\"")
+    var parakeetModelVersion: String = "v3"
+
     @Option(help: "Paths to audio files")
     var audioPath = [String]()
 
